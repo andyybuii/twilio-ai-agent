@@ -2,11 +2,8 @@ const express = require("express");
 const twilio = require("twilio");
 
 const app = express();
-
-// Twilio sends webhooks as x-www-form-urlencoded by default
 app.use(express.urlencoded({ extended: false }));
 
-// --------- ENV VARS ---------
 const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
@@ -15,7 +12,6 @@ const {
   PORT,
 } = process.env;
 
-// Basic safety check (helps debugging if env vars missing)
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing env var: ${name}`);
 }
@@ -24,35 +20,33 @@ app.get("/", (req, res) => {
   res.status(200).send("Twilio webhook running ✅");
 });
 
-// --------- MAIN VOICE WEBHOOK ---------
-// Twilio Voice -> "A call comes in" should point here: /voice (HTTP POST)
+// Twilio Voice webhook: set your phone number "A call comes in" to POST https://<railway-url>/voice
 app.post("/voice", (req, res) => {
   try {
     requireEnv("OWNER_NUMBER", OWNER_NUMBER);
 
-    const twiml = new twilio.twiml.VoiceResponse();
+    const vr = new twilio.twiml.VoiceResponse();
 
-    // Try calling you first (so it's NOT treated as "missed" unless you don't answer)
-    const dial = twiml.dial({
-      timeout: 20, // seconds it rings your phone
-      action: "/missed", // Twilio will POST here after the dial attempt ends
+    const dial = vr.dial({
+      timeout: 20,
+      action: "/missed",
       method: "POST",
     });
 
     dial.number(OWNER_NUMBER);
 
     res.type("text/xml");
-    res.send(twiml.toString());
+    res.send(vr.toString());
   } catch (err) {
     console.error("Error in /voice:", err);
     res.status(500).send("Server error");
   }
 });
 
-// --------- MISSED CALL HANDLER ---------
-// This is triggered after the Dial attempt.
-// We only send SMS + call you back if the Dial was NOT answered.
+// Called after Dial finishes. If not answered -> send SMS + call owner back.
 app.post("/missed", async (req, res) => {
+  const vr = new twilio.twiml.VoiceResponse();
+
   try {
     requireEnv("TWILIO_ACCOUNT_SID", TWILIO_ACCOUNT_SID);
     requireEnv("TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN);
@@ -62,53 +56,68 @@ app.post("/missed", async (req, res) => {
     const caller = req.body.From || "Unknown caller";
     const dialCallStatus = req.body.DialCallStatus; // completed, busy, no-answer, failed, canceled
 
-    console.log("Caller:", caller);
+    console.log("---- /missed ----");
+    console.log("From (caller):", caller);
     console.log("DialCallStatus:", dialCallStatus);
+    console.log("TWILIO_NUMBER:", TWILIO_NUMBER);
+    console.log("OWNER_NUMBER:", OWNER_NUMBER);
 
-    const twiml = new twilio.twiml.VoiceResponse();
-
-    // If you answered the call, do nothing.
+    // If answered (including voicemail), do nothing
     if (dialCallStatus === "completed") {
-      twiml.hangup();
+      vr.hangup();
       res.type("text/xml");
-      return res.send(twiml.toString());
+      return res.send(vr.toString());
     }
 
     const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-    // 1) Send SMS to you
-    await client.messages.create({
-      from: TWILIO_NUMBER,
-      to: OWNER_NUMBER,
-      body: `Missed call from ${caller}`,
-    });
+    // 1) SMS you
+    try {
+      console.log("Sending SMS...");
+      const msg = await client.messages.create({
+        from: TWILIO_NUMBER,
+        to: OWNER_NUMBER,
+        body: `Missed call from ${caller}`,
+      });
+      console.log("SMS sent. SID:", msg.sid);
+    } catch (e) {
+      console.error("SMS FAILED:", e?.message || e);
+      if (e?.code) console.error("SMS Twilio code:", e.code);
+      if (e?.moreInfo) console.error("SMS moreInfo:", e.moreInfo);
+    }
 
     // 2) Call you back with a spoken message
-    await client.calls.create({
-      from: TWILIO_NUMBER,
-      to: OWNER_NUMBER,
-      twiml: `<Response><Say voice="alice">You missed a call from ${caller}.</Say></Response>`,
-    });
+    try {
+      console.log("Placing callback call...");
+      const call = await client.calls.create({
+        from: TWILIO_NUMBER,
+        to: OWNER_NUMBER,
+        twiml: `<Response><Say voice="alice">You missed a call from ${caller}.</Say></Response>`,
+      });
+      console.log("Callback call created. SID:", call.sid);
+    } catch (e) {
+      console.error("CALLBACK FAILED:", e?.message || e);
+      if (e?.code) console.error("CALLBACK Twilio code:", e.code);
+      if (e?.moreInfo) console.error("CALLBACK moreInfo:", e.moreInfo);
+    }
 
     // What the original caller hears
-    twiml.say("Sorry, we missed your call. We will call you back shortly.");
-    twiml.hangup();
+    vr.say("Sorry, we missed your call. We will call you back shortly.");
+    vr.hangup();
 
     res.type("text/xml");
-    res.send(twiml.toString());
+    res.send(vr.toString());
   } catch (err) {
-    console.error("Error in /missed:", err);
+    console.error("Error in /missed (outer):", err);
 
-    const twiml = new twilio.twiml.VoiceResponse();
-    twiml.say("Sorry, an error occurred.");
-    twiml.hangup();
+    vr.say("Sorry, an error occurred.");
+    vr.hangup();
 
     res.type("text/xml");
-    res.send(twiml.toString());
+    res.send(vr.toString());
   }
 });
 
-// --------- START SERVER ---------
 const listenPort = PORT || 3000;
 app.listen(listenPort, () => {
   console.log(`Server running on port ${listenPort}`);
