@@ -1,10 +1,9 @@
 {
   "name": "twilio-ai-agent",
   "version": "1.0.0",
-  "main": "index.js",
-  "type": "commonjs",
+  "main": "index.cjs",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.cjs"
   },
   "dependencies": {
     "express": "^4.19.2",
