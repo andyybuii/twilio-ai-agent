@@ -9,6 +9,14 @@ const {
   EMAIL_FROM,
 } = process.env;
 
+console.log("SENDGRID ENV CHECK:", {
+  hasKey: !!process.env.SENDGRID_API_KEY,
+  hasEmailTo: !!process.env.EMAIL_TO,
+  hasEmailFrom: !!process.env.EMAIL_FROM,
+  emailTo: process.env.EMAIL_TO || null,
+  emailFrom: process.env.EMAIL_FROM || null,
+});
+
 if (SENDGRID_API_KEY) {
   sgMail.setApiKey(SENDGRID_API_KEY);
 }
@@ -121,17 +129,30 @@ app.post("/post_dial", async (req, res) => {
 
     // Send email alert too
 if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
-  await sgMail.send({
-    to: EMAIL_TO,
-    from: EMAIL_FROM,
-    subject: `${BUSINESS_NAME || "Missed call"}: ${caller}`,
-    text: `Missed call
+  try {
+    await sgMail.send({
+      to: EMAIL_TO,
+      from: EMAIL_FROM,
+      subject: `${BUSINESS_NAME || "Missed call"}: ${caller}`,
+      text: `Missed call
 
 From: ${caller}
 Status: ${dialCallStatus}
 AnsweredBy: ${answeredBy || "n/a"}
 Time: ${new Date().toISOString()}`,
+    });
+
+    console.log("✅ Email sent");
+  } catch (e) {
+    console.error("❌ SendGrid error:", e?.response?.body || e.message || e);
+  }
+} else {
+  console.log("⚠️ Email skipped - missing env vars", {
+    hasKey: !!SENDGRID_API_KEY,
+    hasEmailTo: !!EMAIL_TO,
+    hasEmailFrom: !!EMAIL_FROM,
   });
+}
 
   console.log("✅ Email sent");
 } else {
