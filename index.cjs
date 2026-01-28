@@ -57,12 +57,14 @@ app.post("/voice", (req, res) => {
     requireEnv("OWNER_NUMBER", OWNER_NUMBER);
 
     const dial = twiml.dial({
-      timeout: RING_TIMEOUT_SECONDS,
-      action: "/post_dial", // relative is safest
-      method: "POST",
-    });
+  timeout: RING_TIMEOUT_SECONDS,
+  action: "/post_dial",
+  method: "POST",
+  callerId: TWILIO_NUMBER,     // ✅ make the outbound leg come from your Twilio number
+  answerOnBridge: true         // ✅ don't connect caller until you answer
+});
 
-    dial.number(OWNER_NUMBER);
+dial.number(OWNER_NUMBER);
 
     return res.type("text/xml").send(twiml.toString());
   } catch (e) {
