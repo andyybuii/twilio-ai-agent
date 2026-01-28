@@ -1,6 +1,18 @@
 const express = require("express");
 const twilio = require("twilio");
 
+const sgMail = require("@sendgrid/mail");
+
+const {
+  SENDGRID_API_KEY,
+  EMAIL_TO,
+  EMAIL_FROM,
+} = process.env;
+
+if (SENDGRID_API_KEY) {
+  sgMail.setApiKey(SENDGRID_API_KEY);
+}
+
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
@@ -106,6 +118,25 @@ app.post("/post_dial", async (req, res) => {
       to: OWNER_NUMBER,
       body: `📞 Missed call from ${caller}`,
     });
+
+    // Send email alert too
+if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
+  await sgMail.send({
+    to: EMAIL_TO,
+    from: EMAIL_FROM,
+    subject: `${BUSINESS_NAME || "Missed call"}: ${caller}`,
+    text: `Missed call
+
+From: ${caller}
+Status: ${dialCallStatus}
+AnsweredBy: ${answeredBy || "n/a"}
+Time: ${new Date().toISOString()}`,
+  });
+
+  console.log("✅ Email sent");
+} else {
+  console.log("⚠️ Email skipped - missing env vars");
+}
 
     if (typeof caller === "string" && caller.startsWith("+")) {
       await client.messages.create({
