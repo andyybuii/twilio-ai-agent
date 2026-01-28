@@ -13,6 +13,11 @@ const {
   PORT,
 } = process.env;
 
+console.log("ENV CHECK:", {
+  hasBusinessName: !!process.env.BUSINESS_NAME,
+  businessName: process.env.BUSINESS_NAME || null,
+});
+
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing env var: ${name}`);
 }
@@ -68,7 +73,7 @@ app.post("/post_dial", async (req, res) => {
     requireEnv("TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN);
     requireEnv("TWILIO_NUMBER", TWILIO_NUMBER);
     requireEnv("OWNER_NUMBER", OWNER_NUMBER);
-    requireEnv("BUSINESS_NAME", BUSINESS_NAME);
+    const businessName = BUSINESS_NAME || "our team";
 
     const caller = req.body.From || "Unknown caller";
     const dialCallStatus = (req.body.DialCallStatus || "").toLowerCase(); // completed, no-answer, busy, failed, canceled
@@ -106,7 +111,7 @@ app.post("/post_dial", async (req, res) => {
       await client.messages.create({
         from: TWILIO_NUMBER,
         to: caller,
-        body: `Hi, this is ${BUSINESS_NAME}. Sorry we missed your call. Reply with your name, location, and what you need help with — we’ll get back to you ASAP.`,
+        body: `Hi, this is ${businessName}. Sorry we missed your call. Reply with your name, location, and what you need help with — we’ll get back to you ASAP.`,
       });
     }
 
