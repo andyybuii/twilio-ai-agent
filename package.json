@@ -10,5 +10,6 @@
     "express": "^4.19.2",
     "twilio": "^4.23.0",
     "@sendgrid/mail": "^8.1.0"
+    "openai": "^4.0.0"
   }
 }
