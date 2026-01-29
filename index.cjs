@@ -180,6 +180,64 @@ Time: ${new Date().toISOString()}`,
 
 const listenPort = PORT || 3000;
 
+// ================= INBOUND SMS (Reply Forwarding) =================
+// Twilio -> Messaging webhook: POST /sms
+app.post("/sms", async (req, res) => {
+  try {
+    // Twilio inbound SMS fields
+    const from = req.body.From; // customer number
+    const to = req.body.To;     // your Twilio number
+    const body = (req.body.Body || "").trim();
+
+    console.log("---- /sms inbound ----");
+    console.log({ from, to, body });
+
+    // 1) Forward reply to OWNER via SMS
+    await client.messages.create({
+      from: TWILIO_NUMBER,
+      to: OWNER_NUMBER,
+      body: `📩 Reply from ${from}\n\n"${body}"`,
+    });
+
+    console.log("✅ Forwarded reply to owner via SMS");
+
+    // 2) Email the reply too (optional but recommended)
+    if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
+      try {
+        await sgMail.send({
+          to: EMAIL_TO,
+          from: EMAIL_FROM,
+          subject: `${BUSINESS_NAME || "New SMS reply"} – ${from}`,
+          text: `Customer replied to missed-call SMS.\n\nFrom: ${from}\nTo (Twilio): ${to}\n\nMessage:\n${body}\n\nTime: ${new Date().toISOString()}`,
+        });
+        console.log("✅ Reply email sent");
+      } catch (e) {
+        console.error("❌ Reply email failed:", e?.response?.body || e?.message || e);
+      }
+    } else {
+      console.log("⚠️ Reply email skipped - missing env vars");
+    }
+
+    // 3) Optional: auto-confirm to customer (keeps it human)
+    // You can comment this out if you don't want it.
+    await client.messages.create({
+      from: TWILIO_NUMBER,
+      to: from,
+      body: `Thanks — we’ve received your message. ${
+        BUSINESS_NAME || "The team"
+      } will contact you as soon as possible.`,
+    });
+
+    console.log("✅ Confirmed receipt to customer");
+
+    // Twilio expects a 200 OK quickly
+    return res.status(200).send("OK");
+  } catch (err) {
+    console.error("❌ /sms error:", err);
+    return res.status(200).send("OK"); // still return 200 so Twilio doesn't keep retrying forever
+  }
+});
+
 app.listen(listenPort, () => {
   console.log(`🚀 Server running on port ${listenPort}`);
 });
