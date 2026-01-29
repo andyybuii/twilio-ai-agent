@@ -122,76 +122,89 @@ function consideredAnswered({ dialCallStatus, answeredBy, dialCallDuration }) {
 app.get("/", (req, res) => res.status(200).send("OK"));
 
 // 1) Inbound call webhook (Twilio Voice URL)
-app.post("/voice", (req, res) => {
-  console.log("🔥 /voice HIT - FORCE_AFTER_HOURS =", process.env.FORCE_AFTER_HOURS);
+app.post("/voice", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
+  const caller = req.body.From;
 
-  try {
-    const caller = req.body.From || "Unknown";
+  const inHours = isWithinBusinessHours();
 
-    // FORCE toggle (set in Railway env vars)
-    const forceAfterHours =
-      String(process.env.FORCE_AFTER_HOURS || "false").toLowerCase() === "true";
+  console.log("---- /voice ----", { caller, inHours });
 
-    // Calculate hours only if not forcing
-    const nowInBusinessHours = isWithinBusinessHours();
-    const inHours = forceAfterHours ? false : nowInBusinessHours;
-
-    console.log("---- /voice ----");
-    console.log({
-      caller,
-      forceAfterHours,
-      nowInBusinessHours,
-      decision_inHours: inHours,
-    });
-
-    // ✅ BUSINESS HOURS: forward to owner
-    if (inHours) {
-      const dial = twiml.dial({
-        timeout: 20,
-        action: "/post_dial", // your existing missed-call handler
-        method: "POST",
-      });
-
-      // Use FORWARD_TO if you have it, otherwise OWNER_NUMBER
-      dial.number(process.env.FORWARD_TO || process.env.OWNER_NUMBER);
-
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    // ✅ AFTER HOURS: AI intake (speech gather)
-    twiml.say(
-      { voice: "alice" },
-      `Hi, you’ve reached ${process.env.BUSINESS_NAME || "our team"}. We’re currently closed, but I can take your details and we’ll call you in the morning.`
-    );
-
-    const gather = twiml.gather({
-      input: "speech",
-      action: "/afterhours",
+  if (inHours) {
+    // Forward call to owner phone (or office line)
+    const dial = twiml.dial({
+      action: "/post_dial",        // Twilio hits this when Dial finishes
       method: "POST",
-      speechTimeout: "auto",
-      timeout: 6,
+      timeout: 20,                 // ring time
     });
 
-    gather.say(
-      { voice: "alice" },
-      "Please tell me your name, your suburb, what the issue is, and whether it’s an emergency."
-    );
+    dial.number(FORWARD_TO);
 
-    twiml.say(
-      { voice: "alice" },
-      "Sorry, I didn’t catch that. Please call again, or text this number. Goodbye."
-    );
-    twiml.hangup();
+    // Optional: whisper to owner before connecting
+    // twiml.say({ voice: "alice" }, "Incoming call.");
 
-    return res.type("text/xml").send(twiml.toString());
-  } catch (err) {
-    console.error("❌ /voice error:", err);
-    twiml.say("Sorry, something went wrong.");
-    twiml.hangup();
     return res.type("text/xml").send(twiml.toString());
   }
+
+  // AFTER HOURS: AI receptionist
+  twiml.say(
+    { voice: "alice" },
+    `Hi, you’ve reached ${BUSINESS_NAME}. We’re currently closed, but I can take your details and we’ll call you in the morning.`
+  );
+
+  // We do a 2-step gather:
+  // Step A: ask all details in one go (simpler)
+  const gather = twiml.gather({
+    input: "speech",
+    action: "/afterhours",
+    method: "POST",
+    speechTimeout: "auto",
+    timeout: 6,
+  });
+
+  gather.say(
+    { voice: "alice" },
+    "Please tell me your name, your suburb, what the issue is, and whether it’s an emergency."
+  );
+
+  // If no speech captured, fallback
+  twiml.say({ voice: "alice" }, "Sorry, I didn’t catch that. Please call again, or text this number. Goodbye.");
+  twiml.hangup();
+
+  return res.type("text/xml").send(twiml.toString());
 });
+
+// 2) After-hours handler: take speech transcript, ask OpenAI to structure it, then alert owner (SMS + email)
+app.post("/afterhours", async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const caller = req.body.From;
+  const speech = (req.body.SpeechResult || "").trim();
+
+  console.log("---- /afterhours ----", { caller, speech });
+
+  // If OpenAI isn't configured, still do something useful
+  let extracted = {
+    name: "",
+    location: "",
+    issue: speech || "",
+    emergency: "",
+  };
+
+  if (openai && speech) {
+    try {
+      // Using Responses API via the Node SDK  [oai_citation:1‡platform.openai.com](https://platform.openai.com/docs/guides/tools-web-search?utm_source=chatgpt.com)
+      const response = await openai.responses.create({
+        model: "gpt-5",
+        reasoning: { effort: "low" },
+        input: [
+          {
+            role: "system",
+            content:
+              "You are a phone receptionist for a trades business in Australia. Extract details from the caller message. Output ONLY valid JSON with keys: name, location, issue, emergency (yes/no/unsure). If unknown, use empty string.",
+          },
+          { role: "user", content: speech },
+        ],
+      });
 
       const txt = (response.output_text || "").trim();
 
