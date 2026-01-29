@@ -123,6 +123,7 @@ app.get("/", (req, res) => res.status(200).send("OK"));
 
 // 1) Inbound call webhook (Twilio Voice URL)
 app.post("/voice", (req, res) => {
+  console.log("🔥 /voice HIT - FORCE_AFTER_HOURS =", process.env.FORCE_AFTER_HOURS);
   const twiml = new twilio.twiml.VoiceResponse();
 
   try {
