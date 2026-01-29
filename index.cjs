@@ -141,7 +141,7 @@ app.post("/voice", async (req, res) => {
     dial.number(FORWARD_TO);
 
     // Optional: whisper to owner before connecting
-    // twiml.say({ voice: "alice" }, "Incoming call.");
+    /twiml.say({ voice: "Polly.Nicole" }, "text...");
 
     return res.type("text/xml").send(twiml.toString());
   }
