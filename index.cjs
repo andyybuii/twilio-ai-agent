@@ -126,7 +126,8 @@ app.post("/voice", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const caller = req.body.From;
 
-  const inHours = isWithinBusinessHours();
+  const forceAfterHours = String(process.env.FORCE_AFTER_HOURS || "false") === "true";
+const inHours = forceAfterHours ? false : isWithinBusinessHours();
 
   console.log("---- /voice ----", { caller, inHours });
 
