@@ -164,7 +164,19 @@ app.get("/", (req, res) => res.status(200).send("OK"));
 
 // -------------------- VOICE WEBHOOK --------------------
 // Set Twilio phone number Voice webhook to POST {PUBLIC_BASE_URL}/voice
-app.post("/voice", (req, res) => {
+app.post("/voice", async (req, res) => {
+  try {
+
+    // your logic here
+    await playVoice("Hello, this is Andy's Plumbing");
+
+    res.send("OK");
+
+  } catch (err) {
+    console.error(err);
+    res.send("Error");
+  }
+});
   const twiml = new twilio.twiml.VoiceResponse();
   const caller = req.body.From || "Unknown";
   const inHours = isWithinBusinessHours();
