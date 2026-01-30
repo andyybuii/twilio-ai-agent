@@ -150,7 +150,7 @@ app.get("/audio", async (req, res) => {
       body: JSON.stringify({
         text,
         model_id: "eleven_multilingual_v2",
-        voice_settings: { stability: 0.35, similarity_boost: 0.9 },
+        voice_settings: { stability: 0.25, similarity_boost: 0.95 },
       }),
     });
 
@@ -293,10 +293,39 @@ app.post("/afterhours", async (req, res) => {
     }
   }
 
-  sayOrPlay(twiml, "Thank you. We’ve received your details and you will receive a call in the morning.");
-  twiml.hangup();
+  const emergencyValue = String(extracted.emergency || "").toLowerCase();
+const isEmergency =
+  emergencyValue.includes("yes") ||
+  emergencyValue.includes("true") ||
+  emergencyValue.includes("emerg");
 
-  return res.type("text/xml").send(twiml.toString());
+if (isEmergency) {
+  // Optional: immediately call the owner as well (not just SMS/email)
+  try {
+    await client.calls.create({
+      from: TWILIO_NUMBER,
+      to: OWNER_NUMBER,
+      twiml: `<Response><Say voice="alice">Emergency after hours call from ${caller}. Please check your text messages now.</Say></Response>`,
+    });
+    console.log("✅ Emergency call placed to owner");
+  } catch (e) {
+    console.error("❌ Emergency call failed:", e?.message || e);
+  }
+
+  // What caller hears (custom emergency line)
+  sayOrPlay(
+    twiml,
+    "Thanks — this sounds urgent. We’re going to try contact you as soon as possible. If you’re in immediate danger, please call emergency services."
+  );
+} else {
+  sayOrPlay(
+    twiml,
+    "Thank you. We’ve got your details and you’ll receive a call in the morning."
+  );
+}
+
+twiml.hangup();
+return res.type("text/xml").send(twiml.toString());
 });
 
 // 3) Post-Dial: missed call detection
