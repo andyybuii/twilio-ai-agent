@@ -25,14 +25,14 @@ const {
   EMAIL_TO,
   EMAIL_FROM,
 
-  // OpenAI (optional but needed for structured extraction)
+  // OpenAI
   OPENAI_API_KEY,
   OPENAI_MODEL,
 
-  // ElevenLabs (optional for more natural voice)
+  // ElevenLabs (optional)
   ELEVENLABS_API_KEY,
   ELEVENLABS_VOICE_ID,
-  PUBLIC_BASE_URL, // e.g. https://your-railway-domain.up.railway.app
+  PUBLIC_BASE_URL, // e.g. https://nodejs-production-fbbf0.up.railway.app
 
   // Server
   PORT,
@@ -60,12 +60,16 @@ if (SENDGRID_API_KEY) sgMail.setApiKey(SENDGRID_API_KEY);
 
 // Optional: OpenAI
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
-const OPENAI_MODEL_SAFE = OPENAI_MODEL || "gpt-4o-mini"; // change if you want
+const OPENAI_MODEL_SAFE = OPENAI_MODEL || "gpt-4o-mini";
+
+// Normalize base URL (remove trailing slash)
+const BASE_URL = (PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+
+// Twilio client
+const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 console.log("ENV CHECK:", {
   twilio: {
-    hasAccount: !!TWILIO_ACCOUNT_SID,
-    hasToken: !!TWILIO_AUTH_TOKEN,
     twilioNumber: TWILIO_NUMBER || null,
     owner: OWNER_NUMBER || null,
     forwardTo: FORWARD_TO || null,
@@ -88,16 +92,14 @@ console.log("ENV CHECK:", {
   elevenlabs: {
     hasKey: !!ELEVENLABS_API_KEY,
     hasVoiceId: !!ELEVENLABS_VOICE_ID,
-    publicBaseUrl: PUBLIC_BASE_URL || null,
+    baseUrl: BASE_URL || null,
   },
 });
 
 // -------------------- APP SETUP --------------------
 const app = express();
-app.use(express.urlencoded({ extended: false })); // Twilio posts form-encoded
+app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
-
-const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 // -------------------- TIME HELPERS --------------------
 function isWithinBusinessHours() {
@@ -120,7 +122,6 @@ function isWithinBusinessHours() {
   const start = parseInt(BUSINESS_START, 10);
   const end = parseInt(BUSINESS_END, 10);
 
-  // start=8 end=17 means 8:00–16:59
   return hour >= start && hour < end;
 }
 
@@ -130,21 +131,22 @@ function consideredAnswered({ dialCallStatus, answeredBy, dialCallDuration }) {
   return false;
 }
 
-// -------------------- ELEVENLABS (OPTIONAL) --------------------
-// Twilio <Play> needs a PUBLIC URL to an audio file.
-// We generate mp3 in-memory and serve it at /audio/:id
-const audioCache = new Map(); // id -> Buffer
+// -------------------- ELEVENLABS --------------------
+// IMPORTANT: Twilio <Play> must fetch a PUBLIC mp3 URL.
+// We'll cache audio buffers, but ALSO regenerate on demand if cache misses.
+
+const audioCache = new Map();     // id -> Buffer
+const audioTextMap = new Map();   // id -> text (so we can regenerate if cache is empty)
 
 function makeAudioId(text) {
   return crypto.createHash("sha1").update(text).digest("hex");
 }
 
-async function elevenlabsTTSToCache(text) {
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID || !PUBLIC_BASE_URL) return null;
+function elevenEnabled() {
+  return !!(ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID && BASE_URL);
+}
 
-  const id = makeAudioId(text);
-  if (audioCache.has(id)) return id;
-
+async function elevenlabsTTS(text) {
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?output_format=mp3_44100_128`;
 
   const resp = await fetch(url, {
@@ -166,40 +168,81 @@ async function elevenlabsTTSToCache(text) {
 
   if (!resp.ok) {
     const errTxt = await resp.text().catch(() => "");
-    console.error("❌ ElevenLabs TTS failed:", resp.status, errTxt.slice(0, 200));
-    return null;
+    throw new Error(`ElevenLabs failed ${resp.status}: ${errTxt.slice(0, 200)}`);
   }
 
   const arr = await resp.arrayBuffer();
-  const buf = Buffer.from(arr);
-  audioCache.set(id, buf);
-  return id;
+  return Buffer.from(arr);
 }
 
-async function sayOrPlay(twiml, text) {
-  // Try ElevenLabs first (if configured)
+async function ensureAudioCached(text) {
+  if (!elevenEnabled()) return null;
+
+  const id = makeAudioId(text);
+  audioTextMap.set(id, text);
+
+  if (audioCache.has(id)) return id;
+
   try {
-    const id = await elevenlabsTTSToCache(text);
-    if (id) {
-      twiml.play(`${PUBLIC_BASE_URL}/audio/${id}`);
-      return;
-    }
+    const buf = await elevenlabsTTS(text);
+    audioCache.set(id, buf);
+    return id;
   } catch (e) {
-    console.error("❌ sayOrPlay ElevenLabs error:", e?.message || e);
+    console.error("❌ ElevenLabs TTS error:", e?.message || e);
+    return null;
+  }
+}
+
+async function sayOrPlay(twimlNode, text) {
+  // If ElevenLabs configured, prefer <Play>
+  const id = await ensureAudioCached(text);
+
+  if (id) {
+    const url = `${BASE_URL}/audio/${id}`;
+    console.log("🔊 Using ElevenLabs:", url);
+    twimlNode.play(url);
+    return;
   }
 
-  // Fallback to Twilio TTS
-  twiml.say({ voice: "alice" }, text);
+  console.log("🗣️ Falling back to Twilio voice");
+  twimlNode.say({ voice: "alice" }, text);
 }
 
-// Serve cached mp3 to Twilio
-app.get("/audio/:id", (req, res) => {
+// Serve mp3 to Twilio (and regenerate if needed)
+app.get("/audio/:id", async (req, res) => {
   const id = req.params.id;
-  const buf = audioCache.get(id);
-  if (!buf) return res.status(404).send("Not found");
-  res.setHeader("Content-Type", "audio/mpeg");
-  res.setHeader("Cache-Control", "public, max-age=86400");
-  return res.send(buf);
+
+  // Serve from cache if present
+  if (audioCache.has(id)) {
+    const buf = audioCache.get(id);
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    return res.send(buf);
+  }
+
+  // Regenerate on demand if we have the original text
+  const text = audioTextMap.get(id);
+
+  if (!text) {
+    return res.status(404).send("Not found");
+  }
+
+  if (!elevenEnabled()) {
+    return res.status(500).send("ElevenLabs not configured");
+  }
+
+  try {
+    console.log("♻️ Regenerating audio for id:", id);
+    const buf = await elevenlabsTTS(text);
+    audioCache.set(id, buf);
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    return res.send(buf);
+  } catch (e) {
+    console.error("❌ Regenerate failed:", e?.message || e);
+    return res.status(500).send("TTS failed");
+  }
 });
 
 // -------------------- ROUTES --------------------
@@ -215,6 +258,7 @@ app.post("/voice", async (req, res) => {
   const inHours = isWithinBusinessHours();
   console.log("---- /voice ----", { caller, inHours });
 
+  // BUSINESS HOURS: forward
   if (inHours) {
     const dial = twiml.dial({
       action: "/post_dial",
@@ -225,10 +269,10 @@ app.post("/voice", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // AFTER HOURS: take details
+  // AFTER HOURS: ElevenLabs (or fallback)
   await sayOrPlay(
     twiml,
-    `Hi, you’ve reached ${BUSINESS_NAME}. We’re currently closed, but I can take your details and we’ll call you in the morning.`
+    `Hi, you’ve reached ${BUSINESS_NAME}. How can I help you tonight?`
   );
 
   const gather = twiml.gather({
@@ -239,8 +283,9 @@ app.post("/voice", async (req, res) => {
     timeout: 6,
   });
 
-  gather.say(
-    { voice: "alice" },
+  // ✅ Use ElevenLabs inside Gather too
+  await sayOrPlay(
+    gather,
     "Please tell me your name, your suburb, what the issue is, and whether it’s an emergency."
   );
 
@@ -260,7 +305,6 @@ app.post("/afterhours", async (req, res) => {
 
   let extracted = { name: "", location: "", issue: speech || "", emergency: "" };
 
-  // OpenAI structuring (optional)
   if (openai && speech) {
     try {
       const response = await openai.responses.create({
@@ -276,8 +320,6 @@ app.post("/afterhours", async (req, res) => {
       });
 
       const txt = (response.output_text || "").trim();
-
-      // safer parse: grab first JSON object if model adds extra text
       const match = txt.match(/\{[\s\S]*\}/);
       const jsonStr = match ? match[0] : txt;
 
@@ -287,7 +329,7 @@ app.post("/afterhours", async (req, res) => {
     }
   }
 
-  // Alert owner SMS
+  // Owner SMS
   try {
     await client.messages.create({
       from: TWILIO_NUMBER,
@@ -305,7 +347,7 @@ app.post("/afterhours", async (req, res) => {
     console.error("❌ After-hours SMS failed:", e?.message || e);
   }
 
-  // Email owner too (optional)
+  // Optional email
   if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
     try {
       await sgMail.send({
@@ -331,7 +373,7 @@ app.post("/afterhours", async (req, res) => {
 
   await sayOrPlay(
     twiml,
-    "Thank you. We’ve received your details and you will receive a call in the morning."
+    "Thanks — we’ve got your details. Someone will call you first thing in the morning."
   );
   twiml.hangup();
 
@@ -379,7 +421,7 @@ app.post("/post_dial", async (req, res) => {
 
     console.log("✅ SMS sent to owner + caller");
 
-    // Email alert too
+    // Optional email
     if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
       try {
         await sgMail.send({
@@ -412,8 +454,8 @@ app.post("/post_dial", async (req, res) => {
 // 4) Inbound SMS: forward replies to owner
 app.post("/sms", async (req, res) => {
   try {
-    const from = req.body.From; // customer
-    const to = req.body.To; // Twilio number
+    const from = req.body.From;
+    const to = req.body.To;
     const body = (req.body.Body || "").trim();
 
     console.log("---- /sms inbound ----", { from, to, body });
@@ -424,9 +466,8 @@ app.post("/sms", async (req, res) => {
       to: OWNER_NUMBER,
       body: `💬 Reply from ${from}\n\n${body}`,
     });
-    console.log("✅ Forwarded reply to owner via SMS");
 
-    // Email the reply too (optional)
+    // Optional email
     if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
       try {
         await sgMail.send({
@@ -439,21 +480,17 @@ app.post("/sms", async (req, res) => {
             `Message:\n${body}\n\n` +
             `Time: ${new Date().toISOString()}\n`,
         });
-        console.log("✅ Reply email sent");
       } catch (e) {
         console.error("❌ Reply email failed:", e?.response?.body || e?.message || e);
       }
-    } else {
-      console.log("⚠️ Reply email skipped - missing env vars");
     }
 
-    // Auto-confirm to customer (remove this if you don’t want it)
+    // Auto-confirm to customer
     await client.messages.create({
       from: TWILIO_NUMBER,
       to: from,
       body: `Thanks — we’ve received your message. ${BUSINESS_NAME} will contact you as soon as possible.`,
     });
-    console.log("✅ Confirmed receipt to customer");
 
     return res.status(200).send("OK");
   } catch (err) {
