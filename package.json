@@ -7,11 +7,9 @@
     "start": "node index.cjs"
   },
   "dependencies": {
-    "@deepgram/sdk": "^3.6.0",
     "@sendgrid/mail": "^8.1.0",
     "express": "^4.19.2",
     "openai": "^4.0.0",
-    "twilio": "^4.23.0",
-    "ws": "^8.18.0"
+    "twilio": "^4.23.0"
   }
 }
