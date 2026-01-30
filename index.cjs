@@ -3,7 +3,6 @@ const express = require("express");
 const twilio = require("twilio");
 const sgMail = require("@sendgrid/mail");
 const OpenAI = require("openai");
-const crypto = require("crypto");
 
 // -------------------- ENV --------------------
 const {
@@ -25,14 +24,14 @@ const {
   EMAIL_TO,
   EMAIL_FROM,
 
-  // OpenAI
+  // OpenAI (optional but needed for structured extraction)
   OPENAI_API_KEY,
   OPENAI_MODEL,
 
-  // ElevenLabs (optional)
+  // ElevenLabs (optional for natural voice)
   ELEVENLABS_API_KEY,
   ELEVENLABS_VOICE_ID,
-  PUBLIC_BASE_URL, // e.g. https://nodejs-production-fbbf0.up.railway.app
+  PUBLIC_BASE_URL, // MUST be: https://nodejs-production-fbbf0.up.railway.app
 
   // Server
   PORT,
@@ -44,7 +43,7 @@ function requireEnv(name) {
   return v;
 }
 
-// Required for core forwarding + missed call flow
+// Required
 requireEnv("TWILIO_ACCOUNT_SID");
 requireEnv("TWILIO_AUTH_TOKEN");
 requireEnv("TWILIO_NUMBER");
@@ -62,44 +61,24 @@ if (SENDGRID_API_KEY) sgMail.setApiKey(SENDGRID_API_KEY);
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const OPENAI_MODEL_SAFE = OPENAI_MODEL || "gpt-4o-mini";
 
-// Normalize base URL (remove trailing slash)
-const BASE_URL = (PUBLIC_BASE_URL || "").replace(/\/+$/, "");
+// -------------------- APP SETUP --------------------
+const app = express();
+app.use(express.urlencoded({ extended: false })); // Twilio posts form-encoded
+app.use(express.json());
 
-// Twilio client
 const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 console.log("ENV CHECK:", {
-  twilio: {
-    twilioNumber: TWILIO_NUMBER || null,
-    owner: OWNER_NUMBER || null,
-    forwardTo: FORWARD_TO || null,
-  },
-  business: {
-    name: BUSINESS_NAME || null,
-    start: BUSINESS_START || null,
-    end: BUSINESS_END || null,
-    timezone: TIMEZONE || null,
-  },
-  sendgrid: {
-    hasKey: !!SENDGRID_API_KEY,
-    hasTo: !!EMAIL_TO,
-    hasFrom: !!EMAIL_FROM,
-  },
-  openai: {
-    hasKey: !!OPENAI_API_KEY,
-    model: OPENAI_MODEL_SAFE,
-  },
+  twilio: { twilioNumber: TWILIO_NUMBER, owner: OWNER_NUMBER, forwardTo: FORWARD_TO },
+  business: { name: BUSINESS_NAME, start: BUSINESS_START, end: BUSINESS_END, timezone: TIMEZONE },
+  sendgrid: { hasKey: !!SENDGRID_API_KEY, hasTo: !!EMAIL_TO, hasFrom: !!EMAIL_FROM },
+  openai: { hasKey: !!OPENAI_API_KEY, model: OPENAI_MODEL_SAFE },
   elevenlabs: {
     hasKey: !!ELEVENLABS_API_KEY,
     hasVoiceId: !!ELEVENLABS_VOICE_ID,
-    baseUrl: BASE_URL || null,
+    baseUrl: PUBLIC_BASE_URL || null,
   },
 });
-
-// -------------------- APP SETUP --------------------
-const app = express();
-app.use(express.urlencoded({ extended: false }));
-app.use(express.json());
 
 // -------------------- TIME HELPERS --------------------
 function isWithinBusinessHours() {
@@ -131,117 +110,64 @@ function consideredAnswered({ dialCallStatus, answeredBy, dialCallDuration }) {
   return false;
 }
 
-// -------------------- ELEVENLABS --------------------
-// IMPORTANT: Twilio <Play> must fetch a PUBLIC mp3 URL.
-// We'll cache audio buffers, but ALSO regenerate on demand if cache misses.
-
-const audioCache = new Map();     // id -> Buffer
-const audioTextMap = new Map();   // id -> text (so we can regenerate if cache is empty)
-
-function makeAudioId(text) {
-  return crypto.createHash("sha1").update(text).digest("hex");
-}
-
+// -------------------- ELEVENLABS HELPERS --------------------
 function elevenEnabled() {
-  return !!(ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID && BASE_URL);
+  return !!(ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID && PUBLIC_BASE_URL);
 }
 
-async function elevenlabsTTS(text) {
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?output_format=mp3_44100_128`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "xi-api-key": ELEVENLABS_API_KEY,
-      "Content-Type": "application/json",
-      Accept: "audio/mpeg",
-    },
-    body: JSON.stringify({
-      text,
-      model_id: "eleven_multilingual_v2",
-      voice_settings: {
-        stability: 0.4,
-        similarity_boost: 0.85,
-      },
-    }),
-  });
-
-  if (!resp.ok) {
-    const errTxt = await resp.text().catch(() => "");
-    throw new Error(`ElevenLabs failed ${resp.status}: ${errTxt.slice(0, 200)}`);
-  }
-
-  const arr = await resp.arrayBuffer();
-  return Buffer.from(arr);
+// Twilio <Play> needs a public URL. We give it /audio?text=...
+function audioUrlFor(text) {
+  const base = (PUBLIC_BASE_URL || "").replace(/\/$/, "");
+  return `${base}/audio?text=${encodeURIComponent(text)}`;
 }
 
-async function ensureAudioCached(text) {
-  if (!elevenEnabled()) return null;
-
-  const id = makeAudioId(text);
-  audioTextMap.set(id, text);
-
-  if (audioCache.has(id)) return id;
-
-  try {
-    const buf = await elevenlabsTTS(text);
-    audioCache.set(id, buf);
-    return id;
-  } catch (e) {
-    console.error("❌ ElevenLabs TTS error:", e?.message || e);
-    return null;
-  }
-}
-
-async function sayOrPlay(twimlNode, text) {
-  // If ElevenLabs configured, prefer <Play>
-  const id = await ensureAudioCached(text);
-
-  if (id) {
-    const url = `${BASE_URL}/audio/${id}`;
-    console.log("🔊 Using ElevenLabs:", url);
-    twimlNode.play(url);
+function sayOrPlay(twimlOrGather, text) {
+  if (elevenEnabled()) {
+    // Use ElevenLabs voice
+    twimlOrGather.play(audioUrlFor(text));
     return;
   }
-
-  console.log("🗣️ Falling back to Twilio voice");
-  twimlNode.say({ voice: "alice" }, text);
+  // Fallback Twilio voice
+  twimlOrGather.say({ voice: "alice" }, text);
 }
 
-// Serve mp3 to Twilio (and regenerate if needed)
-app.get("/audio/:id", async (req, res) => {
-  const id = req.params.id;
-
-  // Serve from cache if present
-  if (audioCache.has(id)) {
-    const buf = audioCache.get(id);
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "public, max-age=86400");
-    return res.send(buf);
-  }
-
-  // Regenerate on demand if we have the original text
-  const text = audioTextMap.get(id);
-
-  if (!text) {
-    return res.status(404).send("Not found");
-  }
-
-  if (!elevenEnabled()) {
-    return res.status(500).send("ElevenLabs not configured");
-  }
-
+// This endpoint streams mp3 from ElevenLabs to Twilio (no caching needed)
+app.get("/audio", async (req, res) => {
   try {
-    console.log("♻️ Regenerating audio for id:", id);
-    const buf = await elevenlabsTTS(text);
-    audioCache.set(id, buf);
+    const text = (req.query.text || "").toString().trim();
+    if (!text) return res.status(400).send("Missing text");
+    if (!elevenEnabled()) return res.status(500).send("ElevenLabs not configured");
+
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?output_format=mp3_44100_128`;
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: { stability: 0.35, similarity_boost: 0.9 },
+      }),
+    });
+
+    if (!resp.ok) {
+      const errTxt = await resp.text().catch(() => "");
+      console.error("❌ ElevenLabs TTS failed:", resp.status, errTxt.slice(0, 300));
+      return res.status(502).send("ElevenLabs TTS failed");
+    }
 
     res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.setHeader("Cache-Control", "no-store");
+    // Stream response body back to Twilio
+    const buf = Buffer.from(await resp.arrayBuffer());
     return res.send(buf);
   } catch (e) {
-    console.error("❌ Regenerate failed:", e?.message || e);
-    return res.status(500).send("TTS failed");
+    console.error("❌ /audio error:", e?.message || e);
+    return res.status(500).send("Error");
   }
 });
 
@@ -258,7 +184,6 @@ app.post("/voice", async (req, res) => {
   const inHours = isWithinBusinessHours();
   console.log("---- /voice ----", { caller, inHours });
 
-  // BUSINESS HOURS: forward
   if (inHours) {
     const dial = twiml.dial({
       action: "/post_dial",
@@ -269,10 +194,10 @@ app.post("/voice", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // AFTER HOURS: ElevenLabs (or fallback)
-  await sayOrPlay(
+  // AFTER HOURS (ElevenLabs if enabled)
+  sayOrPlay(
     twiml,
-    `Hi, you’ve reached ${BUSINESS_NAME}. How can I help you tonight?`
+    `Hi, you’ve reached ${BUSINESS_NAME}. We’re currently closed, but I can take your details and we’ll call you in the morning.`
   );
 
   const gather = twiml.gather({
@@ -283,13 +208,14 @@ app.post("/voice", async (req, res) => {
     timeout: 6,
   });
 
-  // ✅ Use ElevenLabs inside Gather too
-  await sayOrPlay(
+  // IMPORTANT: use ElevenLabs here too (play inside Gather)
+  sayOrPlay(
     gather,
     "Please tell me your name, your suburb, what the issue is, and whether it’s an emergency."
   );
 
-  twiml.say({ voice: "alice" }, "Sorry, I didn’t catch that. Please call again, or text this number. Goodbye.");
+  // Fallback if no input
+  sayOrPlay(twiml, "Sorry, I didn’t catch that. Please call again, or text this number. Goodbye.");
   twiml.hangup();
 
   return res.type("text/xml").send(twiml.toString());
@@ -321,15 +247,13 @@ app.post("/afterhours", async (req, res) => {
 
       const txt = (response.output_text || "").trim();
       const match = txt.match(/\{[\s\S]*\}/);
-      const jsonStr = match ? match[0] : txt;
-
-      extracted = JSON.parse(jsonStr);
+      extracted = JSON.parse(match ? match[0] : txt);
     } catch (e) {
       console.error("❌ OpenAI extraction failed:", e?.message || e);
     }
   }
 
-  // Owner SMS
+  // SMS owner
   try {
     await client.messages.create({
       from: TWILIO_NUMBER,
@@ -347,7 +271,7 @@ app.post("/afterhours", async (req, res) => {
     console.error("❌ After-hours SMS failed:", e?.message || e);
   }
 
-  // Optional email
+  // Email owner (optional)
   if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
     try {
       await sgMail.send({
@@ -367,14 +291,9 @@ app.post("/afterhours", async (req, res) => {
     } catch (e) {
       console.error("❌ After-hours email failed:", e?.response?.body || e?.message || e);
     }
-  } else {
-    console.log("⚠️ After-hours email skipped - missing env vars");
   }
 
-  await sayOrPlay(
-    twiml,
-    "Thanks — we’ve got your details. Someone will call you first thing in the morning."
-  );
+  sayOrPlay(twiml, "Thank you. We’ve received your details and you will receive a call in the morning.");
   twiml.hangup();
 
   return res.type("text/xml").send(twiml.toString());
@@ -390,8 +309,7 @@ app.post("/post_dial", async (req, res) => {
     const dialCallDuration = req.body.DialCallDuration;
     const answeredBy = req.body.AnsweredBy || "";
 
-    console.log("---- /post_dial ----");
-    console.log({ caller, dialCallStatus, dialCallDuration, answeredBy });
+    console.log("---- /post_dial ----", { caller, dialCallStatus, dialCallDuration, answeredBy });
 
     const isAnswered = consideredAnswered({ dialCallStatus, answeredBy, dialCallDuration });
     console.log("consideredAnswered:", isAnswered);
@@ -421,7 +339,7 @@ app.post("/post_dial", async (req, res) => {
 
     console.log("✅ SMS sent to owner + caller");
 
-    // Optional email
+    // Email alert too
     if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
       try {
         await sgMail.send({
@@ -439,8 +357,6 @@ app.post("/post_dial", async (req, res) => {
       } catch (e) {
         console.error("❌ Email failed:", e?.response?.body || e?.message || e);
       }
-    } else {
-      console.log("⚠️ Email skipped - missing env vars");
     }
 
     twiml.hangup();
@@ -460,32 +376,25 @@ app.post("/sms", async (req, res) => {
 
     console.log("---- /sms inbound ----", { from, to, body });
 
-    // Forward reply to owner
     await client.messages.create({
       from: TWILIO_NUMBER,
       to: OWNER_NUMBER,
       body: `💬 Reply from ${from}\n\n${body}`,
     });
 
-    // Optional email
     if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
-      try {
-        await sgMail.send({
-          to: EMAIL_TO,
-          from: EMAIL_FROM,
-          subject: `${BUSINESS_NAME} - New SMS reply from ${from}`,
-          text:
-            `Customer replied to missed-call SMS.\n\n` +
-            `From: ${from}\nTo (Twilio): ${to}\n\n` +
-            `Message:\n${body}\n\n` +
-            `Time: ${new Date().toISOString()}\n`,
-        });
-      } catch (e) {
-        console.error("❌ Reply email failed:", e?.response?.body || e?.message || e);
-      }
+      await sgMail.send({
+        to: EMAIL_TO,
+        from: EMAIL_FROM,
+        subject: `${BUSINESS_NAME} - New SMS reply from ${from}`,
+        text:
+          `Customer replied to missed-call SMS.\n\n` +
+          `From: ${from}\nTo (Twilio): ${to}\n\n` +
+          `Message:\n${body}\n\n` +
+          `Time: ${new Date().toISOString()}\n`,
+      });
     }
 
-    // Auto-confirm to customer
     await client.messages.create({
       from: TWILIO_NUMBER,
       to: from,
@@ -500,8 +409,5 @@ app.post("/sms", async (req, res) => {
 });
 
 // -------------------- START --------------------
-const listenPort = process.env.PORT || 3000;
-
-app.listen(listenPort, () => {
-  console.log(`🚀 Server running on port ${listenPort}`);
-});
+const listenPort = PORT || 3000;
+app.listen(listenPort, () => console.log(`🚀 Server running on port ${listenPort}`));
