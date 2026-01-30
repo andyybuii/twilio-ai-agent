@@ -500,5 +500,8 @@ app.post("/sms", async (req, res) => {
 });
 
 // -------------------- START --------------------
-const listenPort = PORT || 3000;
-app.listen(listenPort, () => console.log(`🚀 Server running on port ${listenPort}`));
+const listenPort = process.env.PORT || 3000;
+
+app.listen(listenPort, () => {
+  console.log(`🚀 Server running on port ${listenPort}`);
+});
