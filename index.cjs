@@ -5,6 +5,69 @@ const OpenAI = require("openai");
 const WebSocket = require("ws");
 const { createClient } = require("@deepgram/sdk");
 
+const crypto = require("crypto");
+const fetch = global.fetch || require("node-fetch");
+// Cache generated audio
+const audioCache = new Map();
+
+function makeAudioKey(text) {
+  return crypto.createHash("sha1").update(text).digest("hex");
+}
+
+async function elevenlabsTTS(text) {
+  const { ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID } = process.env;
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID) return null;
+
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?output_format=mp3_44100_128`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "xi-api-key": ELEVENLABS_API_KEY,
+      "Content-Type": "application/json",
+      "Accept": "audio/mpeg",
+    },
+    body: JSON.stringify({
+      text,
+      voice_settings: {
+        stability: 0.4,
+        similarity_boost: 0.85,
+        style: 0.4,
+        use_speaker_boost: true,
+      },
+    }),
+  });
+
+  if (!resp.ok) {
+    const errTxt = await resp.text().catch(() => "");
+    throw new Error(`ElevenLabs error ${resp.status}: ${errTxt}`);
+  }
+
+  const arrayBuf = await resp.arrayBuffer();
+  return Buffer.from(arrayBuf);
+}
+
+async function playVoice(twiml, req, text) {
+  const key = makeAudioKey(text);
+
+  if (!audioCache.has(key)) {
+    const audioBuf = await elevenlabsTTS(text);
+    if (audioBuf) audioCache.set(key, audioBuf);
+  }
+
+  if (!audioCache.has(key)) {
+   await playVoice(
+  twiml,
+  req,
+  `Hi, you’ve reached ${BUSINESS_NAME}. We’re currently closed, but I can take your details and we’ll call you in the morning.`
+);
+    return;
+  }
+
+  const base = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+  twiml.play(`${base}/audio/${key}.mp3`);
+}
+
 // -------------------- ENV --------------------
 const {
   TWILIO_ACCOUNT_SID,
@@ -121,7 +184,11 @@ app.post("/voice", (req, res) => {
 
   // After-hours: realtime voice receptionist via Twilio Media Streams
   // Twilio will open a websocket to /twilio-stream
-  twiml.say({ voice: "Polly.Nicole" }, `Hi, you’ve reached ${BUSINESS_NAME}. One moment please.`);
+  await playVoice(
+  twiml,
+  req,
+  `Hi, you’ve reached ${BUSINESS_NAME}. We’re currently closed, but I can take your details and we’ll call you in the morning.`
+);
 
   twiml.connect().stream({
     url: PUBLIC_BASE_URL.replace("https://", "wss://") + "/twilio-stream",
@@ -129,7 +196,11 @@ app.post("/voice", (req, res) => {
   });
 
   // If streaming fails, fallback hangup message
-  twiml.say({ voice: "Polly.Nicole" }, "Sorry, we couldn’t connect. Please text us your name, suburb and issue, and we’ll call you in the morning.");
+await playVoice(
+  twiml,
+  req,
+  `Hi, you’ve reached ${BUSINESS_NAME}. We’re currently closed, but I can take your details and we’ll call you in the morning.`
+);
   twiml.hangup();
 
   return res.type("text/xml").send(twiml.toString());
