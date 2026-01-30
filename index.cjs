@@ -2,31 +2,32 @@ const express = require("express");
 const twilio = require("twilio");
 const sgMail = require("@sendgrid/mail");
 const OpenAI = require("openai");
+const WebSocket = require("ws");
+const { createClient } = require("@deepgram/sdk");
 
 // -------------------- ENV --------------------
 const {
-  // Twilio
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_NUMBER,
   OWNER_NUMBER,
   FORWARD_TO,
 
-  // Business
   BUSINESS_NAME,
   BUSINESS_START,
   BUSINESS_END,
   TIMEZONE,
 
-  // Email
   SENDGRID_API_KEY,
   EMAIL_TO,
   EMAIL_FROM,
 
-  // OpenAI
   OPENAI_API_KEY,
+  DEEPGRAM_API_KEY,
+  ELEVENLABS_API_KEY,
+  ELEVENLABS_VOICE_ID,
 
-  // Server
+  PUBLIC_BASE_URL,
   PORT,
 } = process.env;
 
@@ -36,7 +37,7 @@ function requireEnv(name) {
   return v;
 }
 
-// Required for core flow
+// core
 requireEnv("TWILIO_ACCOUNT_SID");
 requireEnv("TWILIO_AUTH_TOKEN");
 requireEnv("TWILIO_NUMBER");
@@ -46,41 +47,28 @@ requireEnv("BUSINESS_NAME");
 requireEnv("BUSINESS_START");
 requireEnv("BUSINESS_END");
 requireEnv("TIMEZONE");
+requireEnv("PUBLIC_BASE_URL");
 
-// Optional but recommended
-if (SENDGRID_API_KEY) sgMail.setApiKey(SENDGRID_API_KEY);
+// streaming keys (only needed for after-hours realtime)
+requireEnv("DEEPGRAM_API_KEY");
+requireEnv("ELEVENLABS_API_KEY");
+requireEnv("ELEVENLABS_VOICE_ID");
+requireEnv("OPENAI_API_KEY");
 
-const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
-
-console.log("ENV CHECK:", {
-  hasTwilio: !!TWILIO_ACCOUNT_SID && !!TWILIO_AUTH_TOKEN,
-  twilioNumber: TWILIO_NUMBER || null,
-  owner: OWNER_NUMBER || null,
-  forwardTo: FORWARD_TO || null,
-  businessName: BUSINESS_NAME || null,
-  start: BUSINESS_START || null,
-  end: BUSINESS_END || null,
-  timezone: TIMEZONE || null,
-  sendgrid: {
-    hasKey: !!SENDGRID_API_KEY,
-    hasTo: !!EMAIL_TO,
-    hasFrom: !!EMAIL_FROM,
-  },
-  hasOpenAIKey: !!OPENAI_API_KEY,
-});
-
-// -------------------- APP SETUP --------------------
+// -------------------- SETUP --------------------
 const app = express();
-
-// Twilio sends form-encoded by default
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
+if (SENDGRID_API_KEY) sgMail.setApiKey(SENDGRID_API_KEY);
+
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const deepgram = createClient(DEEPGRAM_API_KEY);
+
 // -------------------- TIME HELPERS --------------------
 function isWithinBusinessHours() {
-  // Uses Intl.DateTimeFormat to get hour in TIMEZONE without extra deps
   const tz = TIMEZONE || "Australia/Sydney";
   const now = new Date();
 
@@ -100,304 +88,404 @@ function isWithinBusinessHours() {
   const start = parseInt(BUSINESS_START, 10);
   const end = parseInt(BUSINESS_END, 10);
 
-  // Example: 8 to 17 means 8:00–16:59
   return hour >= start && hour < end;
 }
 
-// Twilio AnsweredBy can be "human", "machine_start", "fax", etc.
-// DialCallStatus can be "completed", "no-answer", "busy", "failed", "canceled"
-function consideredAnswered({ dialCallStatus, answeredBy, dialCallDuration }) {
-  // If Twilio says completed AND there was some duration, usually answered (human or VM)
-  if (dialCallStatus === "completed" && Number(dialCallDuration || 0) > 0) return true;
-
-  // Sometimes answeredBy is present
-  if (answeredBy && String(answeredBy).trim().length > 0) return true;
-
-  return false;
+function consideredAnswered({ dialCallStatus, dialCallDuration }) {
+  // considered answered if completed and lasted at least 5s
+  return dialCallStatus === "completed" && Number(dialCallDuration || 0) >= 5;
 }
 
-// -------------------- ROUTES --------------------
-
-// Health check
+// -------------------- HEALTH --------------------
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-// 1) Inbound call webhook (Twilio Voice URL)
-app.post("/voice", async (req, res) => {
+// -------------------- VOICE WEBHOOK --------------------
+// Set Twilio phone number Voice webhook to POST {PUBLIC_BASE_URL}/voice
+app.post("/voice", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
-  const caller = req.body.From;
-
+  const caller = req.body.From || "Unknown";
   const inHours = isWithinBusinessHours();
 
   console.log("---- /voice ----", { caller, inHours });
 
   if (inHours) {
-    // Forward call to owner phone (or office line)
+    // Business hours: forward call to your phone/office
     const dial = twiml.dial({
-      action: "/post_dial",        // Twilio hits this when Dial finishes
+      action: `${PUBLIC_BASE_URL}/post_dial`,
       method: "POST",
-      timeout: 20,                 // ring time
+      timeout: 20,
     });
-
     dial.number(FORWARD_TO);
-
-    // Optional: whisper to owner before connecting
-    twiml.say({ voice: "Polly.Nicole" }, "text...");
-
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // AFTER HOURS: AI receptionist
-  twiml.say(
-    { voice: "alice" },
-    `Hi, you’ve reached ${BUSINESS_NAME}. We’re currently closed, but I can take your details and we’ll call you in the morning.`
-  );
+  // After-hours: realtime voice receptionist via Twilio Media Streams
+  // Twilio will open a websocket to /twilio-stream
+  twiml.say({ voice: "Polly.Nicole" }, `Hi, you’ve reached ${BUSINESS_NAME}. One moment please.`);
 
-  // We do a 2-step gather:
-  // Step A: ask all details in one go (simpler)
-  const gather = twiml.gather({
-    input: "speech",
-    action: "/afterhours",
-    method: "POST",
-    speechTimeout: "auto",
-    timeout: 6,
+  twiml.connect().stream({
+    url: PUBLIC_BASE_URL.replace("https://", "wss://") + "/twilio-stream",
+    track: "inbound_track", // caller -> us. (We send audio back over same WS)
   });
 
-  gather.say(
-    { voice: "alice" },
-    "Please tell me your name, your suburb, what the issue is, and whether it’s an emergency."
-  );
-
-  // If no speech captured, fallback
-  twiml.say({ voice: "alice" }, "Sorry, I didn’t catch that. Please call again, or text this number. Goodbye.");
+  // If streaming fails, fallback hangup message
+  twiml.say({ voice: "Polly.Nicole" }, "Sorry, we couldn’t connect. Please text us your name, suburb and issue, and we’ll call you in the morning.");
   twiml.hangup();
 
   return res.type("text/xml").send(twiml.toString());
 });
 
-// 2) After-hours handler: take speech transcript, ask OpenAI to structure it, then alert owner (SMS + email)
-app.post("/afterhours", async (req, res) => {
-  const twiml = new twilio.twiml.VoiceResponse();
-  const caller = req.body.From;
-  const speech = (req.body.SpeechResult || "").trim();
-
-  console.log("---- /afterhours ----", { caller, speech });
-
-  // If OpenAI isn't configured, still do something useful
-  let extracted = {
-    name: "",
-    location: "",
-    issue: speech || "",
-    emergency: "",
-  };
-
-  if (openai && speech) {
-    try {
-      // Using Responses API via the Node SDK  [oai_citation:1‡platform.openai.com](https://platform.openai.com/docs/guides/tools-web-search?utm_source=chatgpt.com)
-      const response = await openai.responses.create({
-        model: "gpt-5",
-        reasoning: { effort: "low" },
-        input: [
-          {
-            role: "system",
-            content:
-              "You are a phone receptionist for a trades business in Australia. Extract details from the caller message. Output ONLY valid JSON with keys: name, location, issue, emergency (yes/no/unsure). If unknown, use empty string.",
-          },
-          { role: "user", content: speech },
-        ],
-      });
-
-      const txt = (response.output_text || "").trim();
-
-      // best-effort parse JSON
-      extracted = JSON.parse(txt);
-    } catch (e) {
-      console.error("❌ OpenAI parse failed:", e?.message || e);
-    }
-  }
-
-  // Alert owner via SMS
-  try {
-    await client.messages.create({
-      from: TWILIO_NUMBER,
-      to: OWNER_NUMBER,
-      body:
-        `📞 AFTER HOURS LEAD (${BUSINESS_NAME})\n` +
-        `From: ${caller}\n` +
-        `Name: ${extracted.name || ""}\n` +
-        `Location: ${extracted.location || ""}\n` +
-        `Issue: ${extracted.issue || ""}\n` +
-        `Emergency: ${extracted.emergency || ""}\n`,
-    });
-
-    console.log("✅ After-hours SMS sent to owner");
-  } catch (e) {
-    console.error("❌ After-hours SMS failed:", e?.message || e);
-  }
-
-  // Email owner too
-  if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
-    try {
-      await sgMail.send({
-        to: EMAIL_TO,
-        from: EMAIL_FROM,
-        subject: `${BUSINESS_NAME} - After-hours lead from ${caller}`,
-        text:
-          `AFTER HOURS LEAD\n\n` +
-          `From: ${caller}\n` +
-          `Name: ${extracted.name || ""}\n` +
-          `Location: ${extracted.location || ""}\n` +
-          `Issue: ${extracted.issue || ""}\n` +
-          `Emergency: ${extracted.emergency || ""}\n` +
-          `Captured at: ${new Date().toISOString()}\n`,
-      });
-      console.log("✅ After-hours email sent");
-    } catch (e) {
-      console.error("❌ After-hours email failed:", e?.response?.body || e?.message || e);
-    }
-  } else {
-    console.log("⚠️ After-hours email skipped - missing env vars");
-  }
-
-  // Respond to caller
-  twiml.say(
-    { voice: "alice" },
-    "Thank you. We’ve received your details and you will receive a call in the morning."
-  );
-  twiml.hangup();
-
-  return res.type("text/xml").send(twiml.toString());
-});
-
-// 3) Post-Dial handler: decides if missed, then sends SMS + email
+// -------------------- MISSED CALL HANDLER --------------------
 app.post("/post_dial", async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+
   try {
     const caller = req.body.From;
     const dialCallStatus = req.body.DialCallStatus;
     const dialCallDuration = req.body.DialCallDuration;
-    const answeredBy = req.body.AnsweredBy || "";
 
-    console.log("---- /post_dial ----");
-    console.log({ caller, dialCallStatus, dialCallDuration, answeredBy });
+    console.log("---- /post_dial ----", { caller, dialCallStatus, dialCallDuration });
 
-    const isAnswered = consideredAnswered({ dialCallStatus, answeredBy, dialCallDuration });
-    console.log("consideredAnswered:", isAnswered);
-
-    const twiml = new twilio.twiml.VoiceResponse();
-
-    if (isAnswered) {
-      // nothing else to do
+    if (consideredAnswered({ dialCallStatus, dialCallDuration })) {
       twiml.hangup();
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // MISSED -> send SMS to owner
+    // missed -> SMS owner
     await client.messages.create({
       from: TWILIO_NUMBER,
       to: OWNER_NUMBER,
       body: `📞 Missed call from ${caller} (status: ${dialCallStatus})`,
     });
 
-    // MISSED -> send SMS to caller
+    // missed -> SMS caller
     if (typeof caller === "string" && caller.startsWith("+")) {
       await client.messages.create({
         from: TWILIO_NUMBER,
         to: caller,
-        body:
-          `Hi, this is ${BUSINESS_NAME}. Sorry we missed your call. ` +
-          `Reply with your name, suburb, what the issue is, and if it’s urgent.`,
+        body: `Hi, this is ${BUSINESS_NAME}. Sorry we missed your call. Reply with your name, suburb, issue and if it’s urgent.`,
       });
     }
 
-    console.log("✅ SMS sent to owner + caller");
-
-    // Email alert too
+    // email
     if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
-      try {
-        await sgMail.send({
-          to: EMAIL_TO,
-          from: EMAIL_FROM,
-          subject: `${BUSINESS_NAME} - Missed call: ${caller}`,
-          text:
-            `Missed call\n\n` +
-            `From: ${caller}\n` +
-            `Status: ${dialCallStatus}\n` +
-            `AnsweredBy: ${answeredBy || "n/a"}\n` +
-            `Time: ${new Date().toISOString()}\n`,
-        });
-        console.log("✅ Email sent");
-      } catch (e) {
-        console.error("❌ Email failed:", e?.response?.body || e?.message || e);
-      }
-    } else {
-      console.log("⚠️ Email skipped - missing env vars");
+      await sgMail.send({
+        to: EMAIL_TO,
+        from: EMAIL_FROM,
+        subject: `${BUSINESS_NAME} - Missed call: ${caller}`,
+        text: `Missed call\nFrom: ${caller}\nStatus: ${dialCallStatus}\nTime: ${new Date().toISOString()}\n`,
+      });
     }
 
+    console.log("✅ Missed-call SMS sent to owner + caller");
     twiml.hangup();
     return res.type("text/xml").send(twiml.toString());
-  } catch (err) {
-    console.error("❌ /post_dial error:", err);
-    return res.status(200).send("OK"); // still 200 so Twilio stops retrying
+  } catch (e) {
+    console.error("❌ /post_dial error:", e?.message || e);
+    twiml.hangup();
+    return res.type("text/xml").send(twiml.toString());
   }
 });
 
-// 4) Inbound SMS reply forwarding (Twilio Messaging URL)
+// -------------------- INBOUND SMS REPLY FORWARDING --------------------
 app.post("/sms", async (req, res) => {
   try {
-    const from = req.body.From; // customer number
-    const to = req.body.To;     // your Twilio number
+    const from = req.body.From;
     const body = (req.body.Body || "").trim();
 
-    console.log("---- /sms inbound ----");
-    console.log({ from, to, body });
-
-    // Forward to owner
     await client.messages.create({
       from: TWILIO_NUMBER,
       to: OWNER_NUMBER,
       body: `💬 Reply from ${from}\n\n${body}`,
     });
 
-    console.log("✅ Forwarded reply to owner via SMS");
-
-    // Email the reply too
     if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
-      try {
-        await sgMail.send({
-          to: EMAIL_TO,
-          from: EMAIL_FROM,
-          subject: `${BUSINESS_NAME} - New SMS reply from ${from}`,
-          text:
-            `Customer replied to missed-call SMS.\n\n` +
-            `From: ${from}\nTo (Twilio): ${to}\n\n` +
-            `Message:\n${body}\n\n` +
-            `Time: ${new Date().toISOString()}\n`,
-        });
-        console.log("✅ Reply email sent");
-      } catch (e) {
-        console.error("❌ Reply email failed:", e?.response?.body || e?.message || e);
-      }
-    } else {
-      console.log("⚠️ Reply email skipped - missing env vars");
+      await sgMail.send({
+        to: EMAIL_TO,
+        from: EMAIL_FROM,
+        subject: `${BUSINESS_NAME} - New SMS reply from ${from}`,
+        text: `Reply from: ${from}\n\n${body}\n\nTime: ${new Date().toISOString()}\n`,
+      });
     }
 
-    // Optional: auto-confirm to customer (you said this worked — keep it)
     await client.messages.create({
       from: TWILIO_NUMBER,
       to: from,
       body: `Thanks — we’ve received your message. ${BUSINESS_NAME} will contact you as soon as possible.`,
     });
 
-    console.log("✅ Confirmed receipt to customer");
-
     return res.status(200).send("OK");
-  } catch (err) {
-    console.error("❌ /sms error:", err);
+  } catch (e) {
+    console.error("❌ /sms error:", e?.message || e);
     return res.status(200).send("OK");
   }
 });
 
-// -------------------- START --------------------
-const listenPort = PORT || 3000;
-app.listen(listenPort, () => {
-  console.log(`🚀 Server running on port ${listenPort}`);
+// ============================================================
+// REALTIME AFTER-HOURS VOICE BOT (Twilio Media Streams WS)
+// ============================================================
+
+async function elevenlabsTTS_ulaw8000(text) {
+  // Returns Buffer of mulaw_8000 audio suitable for Twilio
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?output_format=ulaw_8000`;
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "xi-api-key": ELEVENLABS_API_KEY,
+      "Content-Type": "application/json",
+      Accept: "audio/mpeg",
+    },
+    body: JSON.stringify({
+      text,
+      model_id: "eleven_multilingual_v2",
+      voice_settings: {
+        stability: 0.45,
+        similarity_boost: 0.85,
+        style: 0.35,
+        use_speaker_boost: true,
+      },
+    }),
+  });
+
+  if (!r.ok) {
+    const errText = await r.text();
+    throw new Error(`ElevenLabs TTS error ${r.status}: ${errText}`);
+  }
+
+  const arrayBuffer = await r.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+async function llmRespond(conversation, lastUserText) {
+  // conversation: array of {role, content}
+  // returns { replyText, extraction }
+  const sys = `You are an Australian after-hours plumbing receptionist.
+Be warm, natural, and brief. Ask only what you need.
+Your goals:
+1) Collect: name, suburb/location, issue, and emergency (yes/no).
+2) If emergency: acknowledge and say "I’m alerting the on-call plumber now."
+3) Otherwise: promise a call back in the morning.
+Never mention AI.`;
+
+  const messages = [
+    { role: "system", content: sys },
+    ...conversation,
+    { role: "user", content: lastUserText },
+  ];
+
+  const resp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.4,
+    messages,
+  });
+
+  const replyText = resp.choices?.[0]?.message?.content?.trim() || "Thanks. We’ll call you in the morning.";
+
+  // Extract structured info in a second call (more reliable)
+  const extractResp = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0,
+    messages: [
+      {
+        role: "system",
+        content:
+          "Extract details from the conversation. Return ONLY valid JSON with keys: name, location, issue, emergency (yes/no/unsure). Use empty string if unknown.",
+      },
+      { role: "user", content: `Conversation:\n${conversation.map(m => `${m.role}: ${m.content}`).join("\n")}\nuser: ${lastUserText}` },
+    ],
+  });
+
+  let extraction = { name: "", location: "", issue: "", emergency: "unsure" };
+  try {
+    extraction = JSON.parse(extractResp.choices?.[0]?.message?.content || "{}");
+  } catch {}
+
+  return { replyText, extraction };
+}
+
+function sendAudioToTwilio(ws, streamSid, ulawBuffer) {
+  // Twilio expects base64-encoded audio payloads in "media" events.
+  const payload = ulawBuffer.toString("base64");
+  const msg = {
+    event: "media",
+    streamSid,
+    media: { payload },
+  };
+  ws.send(JSON.stringify(msg));
+}
+
+function sendMark(ws, streamSid, name) {
+  ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name } }));
+}
+
+function safeText(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+const server = app.listen(PORT || 3000, () => {
+  console.log(`🚀 Server running on port ${PORT || 3000}`);
+});
+
+const wss = new WebSocket.Server({ server, path: "/twilio-stream" });
+
+wss.on("connection", async (ws) => {
+  console.log("🟢 Twilio stream connected");
+
+  let streamSid = null;
+  let callSid = null;
+
+  // Deepgram live transcription (accept mulaw 8000)
+  const dg = deepgram.listen.live({
+    model: "nova-2",
+    language: "en-AU",
+    encoding: "mulaw",
+    sample_rate: 8000,
+    channels: 1,
+    smart_format: true,
+    interim_results: true,
+    endpointing: 150, // ms
+    utterance_end_ms: 800,
+  });
+
+  let conversation = [];
+  let lastFinal = "";
+  let lastHeardAt = Date.now();
+
+  const greet = async () => {
+    const text = `Hi, this is ${BUSINESS_NAME}. How can I help you tonight?`;
+    try {
+      const audio = await elevenlabsTTS_ulaw8000(text);
+      if (streamSid) sendAudioToTwilio(ws, streamSid, audio);
+      conversation.push({ role: "assistant", content: text });
+    } catch (e) {
+      console.error("❌ TTS greet error:", e?.message || e);
+    }
+  };
+
+  dg.on("open", () => console.log("🟣 Deepgram open"));
+  dg.on("close", () => console.log("🟣 Deepgram close"));
+  dg.on("error", (e) => console.error("❌ Deepgram error:", e));
+
+  dg.on("transcript", async (data) => {
+    try {
+      const alt = data.channel?.alternatives?.[0];
+      const transcript = safeText(alt?.transcript);
+      const isFinal = data.is_final;
+
+      if (!transcript) return;
+
+      lastHeardAt = Date.now();
+
+      if (!isFinal) return;
+
+      // Avoid repeating same final
+      if (transcript === lastFinal) return;
+      lastFinal = transcript;
+
+      console.log("🗣️ FINAL:", transcript);
+      conversation.push({ role: "user", content: transcript });
+
+      // Ask LLM what to say next + extraction
+      const { replyText, extraction } = await llmRespond(conversation, transcript);
+      conversation.push({ role: "assistant", content: replyText });
+
+      // Speak it back (human-like AU voice via ElevenLabs)
+      const audio = await elevenlabsTTS_ulaw8000(replyText);
+      if (streamSid) sendAudioToTwilio(ws, streamSid, audio);
+
+      // If emergency YES -> immediately alert owner (SMS + optional email)
+      const emergency = String(extraction.emergency || "").toLowerCase();
+      if (emergency === "yes") {
+        const msg =
+          `🚨 EMERGENCY AFTER HOURS (${BUSINESS_NAME})\n` +
+          `Call: ${callSid || ""}\n` +
+          `Name: ${extraction.name || ""}\n` +
+          `Location: ${extraction.location || ""}\n` +
+          `Issue: ${extraction.issue || transcript}\n`;
+
+        await client.messages.create({ from: TWILIO_NUMBER, to: OWNER_NUMBER, body: msg });
+        if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
+          await sgMail.send({
+            to: EMAIL_TO,
+            from: EMAIL_FROM,
+            subject: `🚨 EMERGENCY - ${BUSINESS_NAME}`,
+            text: msg,
+          });
+        }
+      }
+
+      // If we’ve got enough info, you can end the call politely
+      // (simple heuristic: once we have name + location + issue)
+      const hasName = (extraction.name || "").trim().length > 0;
+      const hasLoc = (extraction.location || "").trim().length > 0;
+      const hasIssue = (extraction.issue || transcript).trim().length > 0;
+
+      if (hasName && hasLoc && hasIssue) {
+        const closing = "Perfect — thanks. We’ll call you in the morning.";
+        const closingAudio = await elevenlabsTTS_ulaw8000(closing);
+        if (streamSid) sendAudioToTwilio(ws, streamSid, closingAudio);
+
+        // Send non-emergency summary to owner
+        const summary =
+          `📞 AFTER HOURS LEAD (${BUSINESS_NAME})\n` +
+          `Call: ${callSid || ""}\n` +
+          `Name: ${extraction.name || ""}\n` +
+          `Location: ${extraction.location || ""}\n` +
+          `Issue: ${extraction.issue || transcript}\n` +
+          `Emergency: ${extraction.emergency || "unsure"}\n`;
+
+        await client.messages.create({ from: TWILIO_NUMBER, to: OWNER_NUMBER, body: summary });
+
+        if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
+          await sgMail.send({
+            to: EMAIL_TO,
+            from: EMAIL_FROM,
+            subject: `${BUSINESS_NAME} - After-hours lead`,
+            text: summary + `\nTime: ${new Date().toISOString()}\n`,
+          });
+        }
+
+        // Mark end, then close WS (Twilio will hang up after stream ends)
+        if (streamSid) sendMark(ws, streamSid, "end_call");
+        ws.close();
+      }
+    } catch (e) {
+      console.error("❌ transcript handler error:", e?.message || e);
+    }
+  });
+
+  ws.on("message", async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+
+      if (msg.event === "start") {
+        streamSid = msg.start.streamSid;
+        callSid = msg.start.callSid;
+        console.log("▶️ start", { streamSid, callSid });
+        await greet();
+        return;
+      }
+
+      if (msg.event === "media") {
+        // Twilio sends base64 mulaw_8k audio
+        const audio = Buffer.from(msg.media.payload, "base64");
+        dg.send(audio);
+        return;
+      }
+
+      if (msg.event === "stop") {
+        console.log("⏹️ stop", { streamSid });
+        dg.finish();
+        return;
+      }
+    } catch (e) {
+      console.error("❌ WS message error:", e?.message || e);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("🔴 Twilio stream disconnected");
+    try { dg.finish(); } catch {}
+  });
 });
