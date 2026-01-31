@@ -228,11 +228,11 @@ app.post("/voice", async (req, res) => {
     timeout: 6,
   });
 
-  // Use ElevenLabs for intro, but gather prompt can be Twilio voice (fine)
-  gather.say(
-    { voice: "alice" },
-    "Please tell me your name, your suburb, what the issue is, and whether it’s an emergency."
-  );
+ // ✅ Use ElevenLabs for gather prompt too
+sayOrPlay(
+  gather,
+  "Please tell me your name, your suburb, what the issue is, and whether it’s an emergency."
+);
 
   await sayOrPlay(twiml, "Sorry, I didn’t catch that. Please call again. Goodbye.");
   twiml.hangup();
