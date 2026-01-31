@@ -278,6 +278,11 @@ app.post("/afterhours", async (req, res) => {
       const jsonStr = match ? match[0] : txt;
 
       extracted = JSON.parse(jsonStr);
+      // ✅ suburb autocorrect
+if (extracted?.location) {
+  const corrected = bestSydneySuburb(extracted.location);
+  if (corrected) extracted.location = corrected;
+}
     } catch (e) {
       console.error("❌ OpenAI extraction failed:", e?.message || e);
     }
