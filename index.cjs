@@ -978,9 +978,6 @@ app.post("/afterhours_suburb", async (req, res) => {
   twiml.redirect({ method: "POST" }, "/voice");
   return res.type("text/xml").send(twiml.toString());
 });
-  twiml.redirect({ method: "POST" }, "/voice");
-  return res.type("text/xml").send(twiml.toString());
-});
 
 // 2B) After-hours: issue step
 app.post("/afterhours_issue", async (req, res) => {
