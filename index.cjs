@@ -933,12 +933,35 @@ app.post("/afterhours_suburb", async (req, res) => {
 
   console.log("---- /afterhours_suburb ----", { caller, rawSuburb });
 
-  const suburb = bestSydneySuburb(rawSuburb) || rawSuburb || "";
+  const snapped = bestSydneySuburb(rawSuburb);
 
+  // ✅ If we cannot confidently map it to a Sydney suburb, ask again
+  if (!snapped) {
+    const gatherRetry = twiml.gather({
+      input: "speech",
+      action: "/afterhours_suburb",
+      method: "POST",
+      timeout: 12,
+      speechTimeout: "auto",
+      language: "en-AU",
+      speechModel: "phone_call",
+      enhanced: true,
+    });
+
+    await sayOrPlay(
+      gatherRetry,
+      "Sorry — I didn’t catch that suburb. Please say it slowly. " +
+        "If it helps, spell it like C-A-N-L-E-Y, V-A-L-E."
+    );
+
+    twiml.redirect({ method: "POST" }, "/voice");
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  // ✅ We have a confident suburb
   const key = Buffer.from(`${caller}|${Date.now()}`).toString("base64url");
-  tempLeadStore.set(key, { caller, suburb });
+  tempLeadStore.set(key, { caller, suburb: snapped });
 
-  // Step 2: ask issue
   const gather2 = twiml.gather({
     input: "speech",
     action: `/afterhours_issue?key=${encodeURIComponent(key)}`,
@@ -950,11 +973,11 @@ app.post("/afterhours_suburb", async (req, res) => {
     enhanced: true,
   });
 
-  await sayOrPlay(
-    gather2,
-    `No worries… And what’s going on?`
-  );
+  await sayOrPlay(gather2, `Got it — ${snapped}. What’s going on?`);
 
+  twiml.redirect({ method: "POST" }, "/voice");
+  return res.type("text/xml").send(twiml.toString());
+});
   twiml.redirect({ method: "POST" }, "/voice");
   return res.type("text/xml").send(twiml.toString());
 });
