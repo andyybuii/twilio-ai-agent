@@ -1120,7 +1120,7 @@ app.post("/afterhours_urgent", async (req, res) => {
   } else {
     await sayOrPlay(
       twiml,
-      "Alright, got it. Thanks for that. We’ve got your details and we’ll get back to you as soon as possible.     "
+      "Alright, got it. Thanks for that. We’ve got your details. We will call you back first thing tomorrow morning.      "
     );
   }
 
