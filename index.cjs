@@ -909,7 +909,7 @@ app.post("/voice", async (req, res) => {
     method: "POST",
 
     // Important: give time, and don't cut off early
-    timeout: 12, // time allowed before they start talking
+    timeout: 5, // time allowed before they start talking
     speechTimeout: "auto", // wait until they stop talking
 
     language: "en-AU",
@@ -950,8 +950,7 @@ app.post("/afterhours_suburb", async (req, res) => {
 
     await sayOrPlay(
       gatherRetry,
-      "Sorry — I didn’t catch that suburb. Please say it slowly. " +
-        "If it helps, spell it like C-A-N-L-E-Y, V-A-L-E."
+      "Sorry — I didn’t catch that suburb. Please say it again slowly and clearly."
     );
 
     twiml.redirect({ method: "POST" }, "/voice");
@@ -966,7 +965,7 @@ app.post("/afterhours_suburb", async (req, res) => {
     input: "speech",
     action: `/afterhours_issue?key=${encodeURIComponent(key)}`,
     method: "POST",
-    timeout: 12,
+    timeout: 8,
     speechTimeout: "auto",
     language: "en-AU",
     speechModel: "phone_call",
@@ -1028,7 +1027,7 @@ app.post("/afterhours_issue", async (req, res) => {
     input: "speech",
     action: `/afterhours_urgent?key=${encodeURIComponent(key)}`,
     method: "POST",
-    timeout: 10,
+    timeout: 6,
     speechTimeout: "auto",
     language: "en-AU",
     speechModel: "phone_call",
@@ -1116,12 +1115,12 @@ app.post("/afterhours_urgent", async (req, res) => {
   if (urgent) {
     await sayOrPlay(
       twiml,
-      "Okay, got it — that sounds urgent. Check your messages now. We’ll try to contact you as soon as possible."
+      "Okay, got it — that sounds urgent. This will be prioritised and we’ll try to contact you within the next 10 minutes."
     );
   } else {
     await sayOrPlay(
       twiml,
-      "Alright… got it. Thanks for that. We’ve got your details and we’ll get back to you as soon as possible."
+      "Alright, got it. Thanks for that. We’ve got your details and we’ll get back to you as soon as possible.     "
     );
   }
 
