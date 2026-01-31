@@ -185,8 +185,6 @@ app.get("/audio", async (req, res) => {
 
 // -------------------- SYDNEY SUBURBS --------------------
 
-const Fuse = require("fuse.js");
-
 const SYDNEY_SUBURBS = [
   "Abbotsbury",
   "Abbotsford",
