@@ -3,6 +3,8 @@ const express = require("express");
 const twilio = require("twilio");
 const sgMail = require("@sendgrid/mail");
 const OpenAI = require("openai");
+const Fuse = require("fuse.js");
+const sydneySuburbs = require("./sydney_suburbs.json");
 
 // -------------------- ENV --------------------
 const {
@@ -159,6 +161,38 @@ app.get("/audio", async (req, res) => {
       console.error("❌ ElevenLabs TTS failed:", resp.status, errTxt.slice(0, 300));
       return res.status(502).send("ElevenLabs TTS failed");
     }
+
+    // -------------------- SYDNEY SUBURB FUZZY MATCH --------------------
+const suburbFuse = new Fuse(sydneySuburbs, {
+  includeScore: true,
+  threshold: 0.35, // lower = stricter; higher = more forgiving
+  distance: 50,
+});
+
+function cleanLocationText(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z\s'-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Returns best matching suburb string or "" if not confident
+function bestSydneySuburb(raw) {
+  const q = cleanLocationText(raw);
+  if (!q) return "";
+
+  const results = suburbFuse.search(q);
+  if (!results || results.length === 0) return "";
+
+  const best = results[0];
+  // Fuse score: 0 = perfect, 1 = worst
+  // Only accept if reasonably confident
+  if (best.score != null && best.score <= 0.30) {
+    return best.item;
+  }
+  return "";
+}
 
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Cache-Control", "no-store");
