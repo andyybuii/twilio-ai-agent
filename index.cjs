@@ -3,8 +3,8 @@ const express = require("express");
 const twilio = require("twilio");
 const sgMail = require("@sendgrid/mail");
 const OpenAI = require("openai");
+const crypto = require("crypto");
 const Fuse = require("fuse.js");
-const sydneySuburbs = require("./sydney_suburbs.json");
 
 // -------------------- ENV --------------------
 const {
@@ -26,11 +26,11 @@ const {
   EMAIL_TO,
   EMAIL_FROM,
 
-  // OpenAI (optional)
+  // OpenAI (optional but recommended)
   OPENAI_API_KEY,
   OPENAI_MODEL,
 
-  // ElevenLabs (optional)
+  // ElevenLabs (optional but recommended for human voice)
   ELEVENLABS_API_KEY,
   ELEVENLABS_VOICE_ID,
   PUBLIC_BASE_URL, // e.g. https://nodejs-production-fbbf0.up.railway.app
@@ -39,13 +39,14 @@ const {
   PORT,
 } = process.env;
 
+// -------------------- REQUIRED ENV CHECK --------------------
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
 
-// Required core
+// Core flow
 requireEnv("TWILIO_ACCOUNT_SID");
 requireEnv("TWILIO_AUTH_TOKEN");
 requireEnv("TWILIO_NUMBER");
@@ -56,17 +57,37 @@ requireEnv("BUSINESS_START");
 requireEnv("BUSINESS_END");
 requireEnv("TIMEZONE");
 
-// Optional
+// Optional: SendGrid
 if (SENDGRID_API_KEY) sgMail.setApiKey(SENDGRID_API_KEY);
+
+// Optional: OpenAI
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
-const OPENAI_MODEL_SAFE = OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_MODEL_SAFE = OPENAI_MODEL || "gpt-4o-mini"; // you can change
 
 // -------------------- APP SETUP --------------------
 const app = express();
-app.use(express.urlencoded({ extended: false })); // Twilio form-encoded
+app.use(express.urlencoded({ extended: false })); // Twilio posts form-encoded
 app.use(express.json());
 
 const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+// -------------------- LOG ENV (SAFE) --------------------
+console.log("ENV CHECK:", {
+  twilio: {
+    twilioNumber: TWILIO_NUMBER || null,
+    owner: OWNER_NUMBER || null,
+    forwardTo: FORWARD_TO || null,
+  },
+  business: {
+    name: BUSINESS_NAME || null,
+    start: BUSINESS_START || null,
+    end: BUSINESS_END || null,
+    timezone: TIMEZONE || null,
+  },
+  sendgrid: { hasKey: !!SENDGRID_API_KEY, hasTo: !!EMAIL_TO, hasFrom: !!EMAIL_FROM },
+  openai: { hasKey: !!OPENAI_API_KEY, model: OPENAI_MODEL_SAFE },
+  elevenlabs: { hasKey: !!ELEVENLABS_API_KEY, hasVoiceId: !!ELEVENLABS_VOICE_ID, baseUrl: PUBLIC_BASE_URL || null },
+});
 
 // -------------------- TIME HELPERS --------------------
 function isWithinBusinessHours() {
@@ -99,49 +120,21 @@ function consideredAnswered({ dialCallStatus, answeredBy, dialCallDuration }) {
   return false;
 }
 
-// -------------------- SYDNEY SUBURB FUZZY MATCH (FUSE.JS) --------------------
-const suburbFuse = new Fuse(sydneySuburbs, {
-  includeScore: true,
-  threshold: 0.35, // lower = stricter; higher = more forgiving
-  distance: 50,
-  ignoreLocation: true,
-  minMatchCharLength: 3,
-});
-
-function cleanLocationText(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-z\s'-]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// Returns suburb string or "" if not confident
-function bestSydneySuburb(raw) {
-  const q = cleanLocationText(raw);
-  if (!q) return "";
-
-  const results = suburbFuse.search(q);
-  if (!results || results.length === 0) return "";
-
-  const best = results[0];
-  // Fuse score: 0 = perfect, 1 = worst
-  if (best.score != null && best.score <= 0.40) return best.item;
-
-  return "";
-}
-
 // -------------------- ELEVENLABS HELPERS --------------------
 function elevenEnabled() {
   return !!(ELEVENLABS_API_KEY && ELEVENLABS_VOICE_ID && PUBLIC_BASE_URL);
 }
 
-// Twilio <Play> needs a public URL. We give it /audio?text=...
-function audioUrlFor(text) {
-  const base = (PUBLIC_BASE_URL || "").replace(/\/$/, "");
-  return `${base}/audio?text=${encodeURIComponent(text)}`;
+function baseUrlClean() {
+  return String(PUBLIC_BASE_URL || "").replace(/\/$/, "");
 }
 
+// Twilio <Play> needs a public URL -> we serve mp3 via /audio?text=
+function audioUrlFor(text) {
+  return `${baseUrlClean()}/audio?text=${encodeURIComponent(text)}`;
+}
+
+// Use ElevenLabs if configured, otherwise fallback to Twilio Say
 function sayOrPlay(twimlOrGather, text) {
   if (elevenEnabled()) {
     twimlOrGather.play(audioUrlFor(text));
@@ -150,12 +143,42 @@ function sayOrPlay(twimlOrGather, text) {
   twimlOrGather.say({ voice: "alice" }, text);
 }
 
+// Optional: small in-memory cache (reduces ElevenLabs calls when text repeats)
+const audioCache = new Map(); // key -> { buf, ts }
+const AUDIO_TTL_MS = 10 * 60 * 1000; // 10 min
+
+function audioKey(text) {
+  return crypto.createHash("sha1").update(String(text || "")).digest("hex");
+}
+
+function getCachedAudio(key) {
+  const item = audioCache.get(key);
+  if (!item) return null;
+  if (Date.now() - item.ts > AUDIO_TTL_MS) {
+    audioCache.delete(key);
+    return null;
+  }
+  return item.buf;
+}
+
+function setCachedAudio(key, buf) {
+  audioCache.set(key, { buf, ts: Date.now() });
+}
+
 // Streams mp3 from ElevenLabs to Twilio
 app.get("/audio", async (req, res) => {
   try {
-    const text = (req.query.text || "").toString().trim();
+    const text = String(req.query.text || "").trim();
     if (!text) return res.status(400).send("Missing text");
     if (!elevenEnabled()) return res.status(500).send("ElevenLabs not configured");
+
+    const key = audioKey(text);
+    const cached = getCachedAudio(key);
+    if (cached) {
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Cache-Control", "no-store");
+      return res.send(cached);
+    }
 
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}/stream?output_format=mp3_44100_128`;
 
@@ -168,8 +191,15 @@ app.get("/audio", async (req, res) => {
       },
       body: JSON.stringify({
         text,
+        // If your account supports other models, keep this as-is for best general quality:
         model_id: "eleven_multilingual_v2",
-        voice_settings: { stability: 0.25, similarity_boost: 0.95 },
+        // Tune these if you want more “human”:
+        voice_settings: {
+          stability: 0.35,
+          similarity_boost: 0.95,
+          style: 0.2,
+          use_speaker_boost: true,
+        },
       }),
     });
 
@@ -179,15 +209,92 @@ app.get("/audio", async (req, res) => {
       return res.status(502).send("ElevenLabs TTS failed");
     }
 
+    const buf = Buffer.from(await resp.arrayBuffer());
+    setCachedAudio(key, buf);
+
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Cache-Control", "no-store");
-    const buf = Buffer.from(await resp.arrayBuffer());
     return res.send(buf);
   } catch (e) {
     console.error("❌ /audio error:", e?.message || e);
     return res.status(500).send("Error");
   }
 });
+
+// -------------------- SYDNEY SUBURB FUZZY MATCH (Fuse.js) --------------------
+// NOTE: This is a starter list + includes your key suburbs.
+// You can expand later by adding the full 600+ list into this array (no other code changes needed).
+const sydneySuburbs = [
+  "Sydney",
+  "Parramatta",
+  "Liverpool",
+  "Penrith",
+  "Blacktown",
+  "Bankstown",
+  "Campbelltown",
+  "Fairfield",
+  "Cabramatta",
+  "Canley Vale",
+  "Canley Heights",
+  "Bonnyrigg",
+  "Wetherill Park",
+  "Smithfield",
+  "Bossley Park",
+  "Edensor Park",
+  "Green Valley",
+  "Mount Pritchard",
+  "Wakeley",
+  "Villawood",
+  "Carramar",
+  "Guildford",
+  "Granville",
+  "Auburn",
+  "Strathfield",
+  "Burwood",
+  "Ashfield",
+  "Newtown",
+  "Chatswood",
+  "Hurstville",
+  "Kogarah",
+  "Sutherland",
+  "Cronulla",
+  "Bondi",
+  "Bondi Junction",
+  "Manly",
+  "Dee Why",
+  "Ryde",
+  "Epping",
+  "Castle Hill",
+  "Rouse Hill",
+];
+
+const suburbFuse = new Fuse(sydneySuburbs, {
+  includeScore: true,
+  threshold: 0.35, // lower = stricter
+  distance: 50,
+});
+
+function cleanLocationText(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z\s'-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Returns best matching suburb string or "" if not confident
+function bestSydneySuburb(raw) {
+  const q = cleanLocationText(raw);
+  if (!q) return "";
+
+  const results = suburbFuse.search(q);
+  if (!results || results.length === 0) return "";
+
+  const best = results[0];
+  // Fuse score: 0 = perfect, 1 = worst
+  if (best.score != null && best.score <= 0.30) return best.item;
+  return "";
+}
 
 // -------------------- ROUTES --------------------
 
@@ -199,245 +306,182 @@ app.post("/voice", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const caller = req.body.From;
 
-  const inHours = isWithinBusinessHours();
-  console.log("---- /voice ----", { caller, inHours });
+  try {
+    const inHours = isWithinBusinessHours();
+    console.log("---- /voice ----", { caller, inHours });
 
-  if (inHours) {
-    // Business hours -> forward call
-    const dial = twiml.dial({
-      action: "/post_dial",
+    if (inHours) {
+      const dial = twiml.dial({
+        action: "/post_dial",
+        method: "POST",
+        timeout: 20,
+      });
+      dial.number(FORWARD_TO);
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // AFTER HOURS INTRO (ElevenLabs)
+    sayOrPlay(
+      twiml,
+      `Hi, this is ${BUSINESS_NAME}. We’re currently helping another customer and couldn’t answer. ` +
+        `Please say your name first, then your suburb, then what the issue is, and finally whether it’s urgent.`
+    );
+
+    // Gather for speech
+    const gather = twiml.gather({
+      input: "speech",
+      action: "/afterhours",
       method: "POST",
-      timeout: 20,
+      speechTimeout: "auto",
+      timeout: 10,
+
+      // Improve recognition
+      language: "en-AU",
+      speechModel: "phone_call",
+      enhanced: true,
     });
 
-    dial.number(FORWARD_TO);
+    // IMPORTANT: Use ElevenLabs voice for the gather prompt too
+    sayOrPlay(
+      gather,
+      "Start with your name, then your suburb, then what the issue is, and whether it’s urgent."
+    );
+
+    // Fallback if no speech captured
+    sayOrPlay(twiml, "Sorry, I didn’t catch that. Please call again, or text this number. Goodbye.");
+    twiml.hangup();
+
+    return res.type("text/xml").send(twiml.toString());
+  } catch (err) {
+    console.error("❌ /voice error:", err);
+    // Always return TwiML so Twilio doesn't throw "application error"
+    sayOrPlay(twiml, "Sorry, something went wrong. Please try again.");
+    twiml.hangup();
     return res.type("text/xml").send(twiml.toString());
   }
-
-  // After hours -> AI receptionist (basic)
-  await sayOrPlay(
-  twiml,
-  `Hi, this is ${BUSINESS_NAME}. We’re currently helping another customer and couldn’t answer. ` +
-  `Please say your name first, then your suburb, then what the issue is, and finally whether it’s urgent.`
-);
-
-  const gather = twiml.gather({
-  input: "speech",
-  action: "/afterhours",
-  method: "POST",
-  speechTimeout: "auto",
-  timeout: 6,
-
-  // ✅ improve recognition for Australia
-  language: "en-AU",
-  speechModel: "phone_call",
-  enhanced: true,
-});
- // ✅ Use ElevenLabs for gather prompt too
-sayOrPlay(
-  gather,
-  "Start with your name, then your suburb, then what the issue is, and whether it’s urgent."
-);
-
-  await sayOrPlay(twiml, "Sorry, I didn’t catch that. Please call again. Goodbye.");
-  twiml.hangup();
-  return res.type("text/xml").send(twiml.toString());
 });
 
 // 2) After-hours handler
 app.post("/afterhours", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
   const caller = req.body.From;
-  const speech = (req.body.SpeechResult || "").trim();
+  const speech = String(req.body.SpeechResult || "").trim();
 
   console.log("---- /afterhours ----", { caller, speech });
 
-  let extracted = {
-    name: "",
-    location: "",
-    issue: speech || "",
-    emergency: "",
-  };
-
-  // OpenAI extraction (optional)
-  if (openai && speech) {
-    try {
-      const response = await openai.responses.create({
-        model: OPENAI_MODEL_SAFE,
-        input: [
-          {
-            role: "system",
-            content:
-              "You are a receptionist for a Sydney plumbing business. Extract details from the caller message. Output ONLY valid JSON with keys: name, location, issue, emergency (yes/no/unsure). Use empty string if unknown.",
-          },
-          { role: "user", content: speech },
-        ],
-      });
-
-      const txt = (response.output_text || "").trim();
-      const match = txt.match(/\{[\s\S]*\}/);
-      const jsonStr = match ? match[0] : txt;
-
-      extracted = JSON.parse(jsonStr);
-      // ✅ suburb autocorrect
-if (extracted?.location) {
-  const corrected = bestSydneySuburb(extracted.location);
-  if (corrected) extracted.location = corrected;
-}
-    } catch (e) {
-      console.error("❌ OpenAI extraction failed:", e?.message || e);
-    }
-  }
-
-  // Sydney suburb correction (Fuse)
-  const corrected =
-    bestSydneySuburb(extracted.location) ||
-    bestSydneySuburb(speech);
-
-  if (corrected) extracted.location = corrected;
-
-  const isEmergency =
-    (extracted.emergency || "").toLowerCase().includes("yes") ||
-    (speech || "").toLowerCase().includes("emergency");
-
-  const Fuse = require("fuse.js");
-
-// ✅ put your full Sydney suburbs array here:
-const sydneySuburbs = [
-  // "Canley Vale",
-  // "Canley Heights",
-  // ...
-];
-
-const suburbFuse = new Fuse(sydneySuburbs, {
-  includeScore: true,
-  threshold: 0.35,
-  distance: 50,
-});
-
-function norm(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^a-z\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-// Simple Levenshtein distance (no extra deps)
-function levenshtein(a, b) {
-  a = norm(a);
-  b = norm(b);
-  if (!a || !b) return 9999;
-
-  const m = a.length, n = b.length;
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
-      );
-    }
-  }
-  return dp[m][n];
-}
-
-function bestSydneySuburb(raw) {
-  const q = norm(raw);
-  if (!q) return "";
-
-  // 1) Try Fuse first
-  const fuseResults = suburbFuse.search(q);
-  if (fuseResults?.length) {
-    const best = fuseResults[0];
-    if (best.score != null && best.score <= 0.30) return best.item;
-  }
-
-  // 2) Fallback: edit-distance against the whole list
-  let best = "";
-  let bestScore = Infinity;
-
-  for (const suburb of sydneySuburbs) {
-    const d = levenshtein(q, suburb);
-    const ratio = d / Math.max(1, norm(suburb).length);
-    if (ratio < bestScore) {
-      bestScore = ratio;
-      best = suburb;
-    }
-  }
-
-  // ✅ accept only if "close enough"
-  // This catches Candyville -> Canley Vale type issues
-  if (best && bestScore <= 0.40) return best;
-
-  return "";
-}
-
-  // Alert owner via SMS
   try {
-    await client.messages.create({
-      from: TWILIO_NUMBER,
-      to: OWNER_NUMBER,
-      body:
-        `📞 AFTER HOURS LEAD (${BUSINESS_NAME})\n` +
-        `From: ${caller}\n` +
-        `Name: ${extracted.name || ""}\n` +
-        `Location: ${extracted.location || ""}\n` +
-        `Issue: ${extracted.issue || ""}\n` +
-        `Emergency: ${extracted.emergency || (isEmergency ? "yes" : "no/unsure")}\n`,
-    });
-    console.log("✅ After-hours SMS sent to owner");
-  } catch (e) {
-    console.error("❌ After-hours SMS failed:", e?.message || e);
-  }
+    // If nothing captured, ask again
+    if (!speech) {
+      sayOrPlay(twiml, "Sorry, I didn’t catch that. Please call again and leave your details.");
+      twiml.hangup();
+      return res.type("text/xml").send(twiml.toString());
+    }
 
-  // Email owner too (optional)
-  if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
+    let extracted = { name: "", location: "", issue: speech, emergency: "" };
+
+    // OpenAI structuring (optional)
+    if (openai) {
+      try {
+        const response = await openai.responses.create({
+          model: OPENAI_MODEL_SAFE,
+          input: [
+            {
+              role: "system",
+              content:
+                "You are a receptionist for an Australian trades business. Extract details from the caller message. " +
+                "Output ONLY valid JSON with keys: name, location, issue, emergency (yes/no/unsure). " +
+                "Use empty string if unknown. Keep location to suburb only if possible.",
+            },
+            { role: "user", content: speech },
+          ],
+        });
+
+        const txt = String(response.output_text || "").trim();
+        const match = txt.match(/\{[\s\S]*\}/);
+        const jsonStr = match ? match[0] : txt;
+
+        extracted = JSON.parse(jsonStr);
+      } catch (e) {
+        console.error("❌ OpenAI extraction failed:", e?.message || e);
+      }
+    }
+
+    // --- Sydney suburb correction ---
+    // Fix things like "Candyville" -> "Canley Vale"
+    const fixedSuburb = bestSydneySuburb(extracted.location || "");
+    if (fixedSuburb) extracted.location = fixedSuburb;
+
+    // Urgency handling (custom line)
+    const emergencyFlag = String(extracted.emergency || "").toLowerCase();
+    const urgent =
+      emergencyFlag.includes("yes") || emergencyFlag.includes("urgent") || emergencyFlag.includes("emergency");
+
+    // Alert owner via SMS
     try {
-      await sgMail.send({
-        to: EMAIL_TO,
-        from: EMAIL_FROM,
-        subject: `${BUSINESS_NAME} - After-hours lead from ${caller}${isEmergency ? " (URGENT)" : ""}`,
-        text:
-          `AFTER HOURS LEAD\n\n` +
+      await client.messages.create({
+        from: TWILIO_NUMBER,
+        to: OWNER_NUMBER,
+        body:
+          `📞 AFTER HOURS LEAD (${BUSINESS_NAME})\n` +
           `From: ${caller}\n` +
           `Name: ${extracted.name || ""}\n` +
-          `Location: ${extracted.location || ""}\n` +
+          `Suburb: ${extracted.location || ""}\n` +
           `Issue: ${extracted.issue || ""}\n` +
-          `Emergency: ${extracted.emergency || (isEmergency ? "yes" : "no/unsure")}\n` +
-          `Captured at: ${new Date().toISOString()}\n`,
+          `Urgent: ${urgent ? "YES" : (extracted.emergency || "")}\n`,
       });
-      console.log("✅ After-hours email sent");
+      console.log("✅ After-hours SMS sent to owner");
     } catch (e) {
-      console.error("❌ After-hours email failed:", e?.response?.body || e?.message || e);
+      console.error("❌ After-hours SMS failed:", e?.message || e);
     }
-  } else {
-    console.log("⚠️ After-hours email skipped - missing env vars");
-  }
 
-  // Caller closing line (custom emergency response)
-  if (isEmergency) {
-    await sayOrPlay(
-      twiml,
-      "Thanks — this sounds urgent. Please check your messages now. We’ll try to contact you as soon as possible."
-    );
-  } else {
-    await sayOrPlay(
-      twiml,
-      "Thanks — we’ve received your details and you will receive a call in the morning.   "
-    );
-  }
+    // Email owner too (optional)
+    if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
+      try {
+        await sgMail.send({
+          to: EMAIL_TO,
+          from: EMAIL_FROM,
+          subject: `${BUSINESS_NAME} - After-hours lead from ${caller}`,
+          text:
+            `AFTER HOURS LEAD\n\n` +
+            `From: ${caller}\n` +
+            `Name: ${extracted.name || ""}\n` +
+            `Suburb: ${extracted.location || ""}\n` +
+            `Issue: ${extracted.issue || ""}\n` +
+            `Urgent: ${urgent ? "YES" : (extracted.emergency || "")}\n` +
+            `Captured at: ${new Date().toISOString()}\n`,
+        });
+        console.log("✅ After-hours email sent");
+      } catch (e) {
+        console.error("❌ After-hours email failed:", e?.response?.body || e?.message || e);
+      }
+    } else {
+      console.log("⚠️ After-hours email skipped - missing env vars");
+    }
 
-  twiml.hangup();
-  return res.type("text/xml").send(twiml.toString());
+    // Speak back to caller
+    if (urgent) {
+      sayOrPlay(
+        twiml,
+        "Thanks. This sounds urgent. Please check your messages now — we will try to contact you as soon as possible."
+      );
+    } else {
+      sayOrPlay(
+        twiml,
+        "Thank you. We’ve received your details and we’ll get back to you as soon as possible."
+      );
+    }
+
+    twiml.hangup();
+    return res.type("text/xml").send(twiml.toString());
+  } catch (err) {
+    console.error("❌ /afterhours error:", err);
+    sayOrPlay(twiml, "Sorry, something went wrong. Please try again.");
+    twiml.hangup();
+    return res.type("text/xml").send(twiml.toString());
+  }
 });
 
-// 3) Post-Dial: missed call detection (business hours)
+// 3) Post-Dial: missed call detection
 app.post("/post_dial", async (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
 
@@ -447,14 +491,11 @@ app.post("/post_dial", async (req, res) => {
     const dialCallDuration = req.body.DialCallDuration;
     const answeredBy = req.body.AnsweredBy || "";
 
-    console.log("---- /post_dial ----", {
-      caller,
-      dialCallStatus,
-      dialCallDuration,
-      answeredBy,
-    });
+    console.log("---- /post_dial ----");
+    console.log({ caller, dialCallStatus, dialCallDuration, answeredBy });
 
     const isAnswered = consideredAnswered({ dialCallStatus, answeredBy, dialCallDuration });
+    console.log("consideredAnswered:", isAnswered);
 
     if (isAnswered) {
       twiml.hangup();
@@ -479,9 +520,9 @@ app.post("/post_dial", async (req, res) => {
       });
     }
 
-    console.log("✅ Missed-call SMS sent to owner + caller");
+    console.log("✅ SMS sent to owner + caller");
 
-    // Optional email alert
+    // Email alert too
     if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
       try {
         await sgMail.send({
@@ -495,37 +536,40 @@ app.post("/post_dial", async (req, res) => {
             `AnsweredBy: ${answeredBy || "n/a"}\n` +
             `Time: ${new Date().toISOString()}\n`,
         });
-        console.log("✅ Missed-call email sent");
+        console.log("✅ Email sent");
       } catch (e) {
-        console.error("❌ Missed-call email failed:", e?.response?.body || e?.message || e);
+        console.error("❌ Email failed:", e?.response?.body || e?.message || e);
       }
+    } else {
+      console.log("⚠️ Email skipped - missing env vars");
     }
 
     twiml.hangup();
     return res.type("text/xml").send(twiml.toString());
   } catch (err) {
     console.error("❌ /post_dial error:", err);
-    return res.status(200).send("OK");
+    return res.status(200).send("OK"); // stop Twilio retries
   }
 });
 
-// 4) Inbound SMS reply forwarding
+// 4) Inbound SMS: forward replies to owner
 app.post("/sms", async (req, res) => {
   try {
-    const from = req.body.From;
-    const to = req.body.To;
-    const body = (req.body.Body || "").trim();
+    const from = req.body.From; // customer
+    const to = req.body.To; // Twilio number
+    const body = String(req.body.Body || "").trim();
 
     console.log("---- /sms inbound ----", { from, to, body });
 
-    // Forward to owner
+    // Forward reply to owner
     await client.messages.create({
       from: TWILIO_NUMBER,
       to: OWNER_NUMBER,
       body: `💬 Reply from ${from}\n\n${body}`,
     });
+    console.log("✅ Forwarded reply to owner via SMS");
 
-    // Optional email
+    // Email the reply too (optional)
     if (SENDGRID_API_KEY && EMAIL_TO && EMAIL_FROM) {
       try {
         await sgMail.send({
@@ -533,19 +577,26 @@ app.post("/sms", async (req, res) => {
           from: EMAIL_FROM,
           subject: `${BUSINESS_NAME} - New SMS reply from ${from}`,
           text:
-            `Customer replied.\n\nFrom: ${from}\nTo (Twilio): ${to}\n\nMessage:\n${body}\n\nTime: ${new Date().toISOString()}\n`,
+            `Customer replied to missed-call SMS.\n\n` +
+            `From: ${from}\nTo (Twilio): ${to}\n\n` +
+            `Message:\n${body}\n\n` +
+            `Time: ${new Date().toISOString()}\n`,
         });
+        console.log("✅ Reply email sent");
       } catch (e) {
         console.error("❌ Reply email failed:", e?.response?.body || e?.message || e);
       }
+    } else {
+      console.log("⚠️ Reply email skipped - missing env vars");
     }
 
-    // Confirm to customer
+    // Auto-confirm to customer (keep/remove as you want)
     await client.messages.create({
       from: TWILIO_NUMBER,
       to: from,
       body: `Thanks — we’ve received your message. ${BUSINESS_NAME} will contact you as soon as possible.`,
     });
+    console.log("✅ Confirmed receipt to customer");
 
     return res.status(200).send("OK");
   } catch (err) {
