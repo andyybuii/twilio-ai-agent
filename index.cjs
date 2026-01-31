@@ -217,7 +217,7 @@ app.post("/voice", async (req, res) => {
   // After hours -> AI receptionist (basic)
   await sayOrPlay(
     twiml,
-    `Hi, you’ve reached ${BUSINESS_NAME}. How can I help you tonight?`
+    `Hey, this is ${BUSINESS_NAME}. We’re currently helping another customer. Please let me know what your name is, your suburb, and what the issue is, and is it urgent? and we’ll get back to you immediately if it is urgent, if not we will call you tomorrow morning.`
   );
 
   const gather = twiml.gather({
