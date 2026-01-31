@@ -288,17 +288,18 @@ app.post("/voice", async (req, res) => {
 
   // Gather (speech-to-text)
   const gather = twiml.gather({
-    input: "speech",
-    action: "/afterhours",
-    method: "POST",
-    speechTimeout: "auto",
-    timeout: 7,
+  input: "speech",
+  action: "/afterhours",
+  method: "POST",
 
-    // Improve recognition for AU callers (Twilio STT)
-    language: "en-AU",
-    speechModel: "phone_call",
-    enhanced: true,
-  });
+  // ⬇️ IMPORTANT FIX
+  speechTimeout: 3,   // wait 3 seconds of silence
+  timeout: 12,        // max wait time
+
+  language: "en-AU",
+  speechModel: "phone_call",
+  enhanced: true,
+});
 
   // ✅ Use ElevenLabs for gather prompt too (so it doesn’t revert to Twilio voice)
   sayOrPlay(
