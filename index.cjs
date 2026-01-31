@@ -231,7 +231,7 @@ app.post("/voice", async (req, res) => {
  // ✅ Use ElevenLabs for gather prompt too
 sayOrPlay(
   gather,
-  "Please tell me your name, your suburb, what the issue is, and whether it’s an emergency."
+  "Alright, can you tell me your name, what suburb you're in, what the issue is, and is it urgent?"
 );
 
   await sayOrPlay(twiml, "Sorry, I didn’t catch that. Please call again. Goodbye.");
