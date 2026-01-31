@@ -217,7 +217,7 @@ app.post("/voice", async (req, res) => {
   // After hours -> AI receptionist (basic)
   await sayOrPlay(
     twiml,
-    `Hey, this is ${BUSINESS_NAME}. We’re currently helping another customer. Please let me know what your name is, your suburb, and what the issue is, and is it urgent? and we’ll get back to you immediately if it is urgent, if not we will call you tomorrow morning.`
+    `Hey, this is ${BUSINESS_NAME}. We’re currently helping another customer. Please let me know what your name is, your suburb, and what the issue is, and is it urgent?   We’ll get back to you immediately if it is urgent, if not we will call you tomorrow morning.`
   );
 
   const gather = twiml.gather({
@@ -231,7 +231,7 @@ app.post("/voice", async (req, res) => {
  // ✅ Use ElevenLabs for gather prompt too
 sayOrPlay(
   gather,
-  "Alright, can you tell me your name, what suburb you're in, what the issue is, and is it urgent?"
+  "Perfect, can you tell me your name, what suburb you're in, what the issue is, and is it urgent?"
 );
 
   await sayOrPlay(twiml, "Sorry, I didn’t catch that. Please call again. Goodbye.");
