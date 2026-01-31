@@ -221,13 +221,17 @@ app.post("/voice", async (req, res) => {
   );
 
   const gather = twiml.gather({
-    input: "speech",
-    action: "/afterhours",
-    method: "POST",
-    speechTimeout: "auto",
-    timeout: 6,
-  });
+  input: "speech",
+  action: "/afterhours",
+  method: "POST",
+  speechTimeout: "auto",
+  timeout: 6,
 
+  // ✅ improve recognition for Australia
+  language: "en-AU",
+  speechModel: "phone_call",
+  enhanced: true,
+});
  // ✅ Use ElevenLabs for gather prompt too
 sayOrPlay(
   gather,
@@ -290,6 +294,84 @@ app.post("/afterhours", async (req, res) => {
     (extracted.emergency || "").toLowerCase().includes("yes") ||
     (speech || "").toLowerCase().includes("emergency");
 
+  const Fuse = require("fuse.js");
+
+// ✅ put your full Sydney suburbs array here:
+const sydneySuburbs = [
+  // "Canley Vale",
+  // "Canley Heights",
+  // ...
+];
+
+const suburbFuse = new Fuse(sydneySuburbs, {
+  includeScore: true,
+  threshold: 0.35,
+  distance: 50,
+});
+
+function norm(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Simple Levenshtein distance (no extra deps)
+function levenshtein(a, b) {
+  a = norm(a);
+  b = norm(b);
+  if (!a || !b) return 9999;
+
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return dp[m][n];
+}
+
+function bestSydneySuburb(raw) {
+  const q = norm(raw);
+  if (!q) return "";
+
+  // 1) Try Fuse first
+  const fuseResults = suburbFuse.search(q);
+  if (fuseResults?.length) {
+    const best = fuseResults[0];
+    if (best.score != null && best.score <= 0.30) return best.item;
+  }
+
+  // 2) Fallback: edit-distance against the whole list
+  let best = "";
+  let bestScore = Infinity;
+
+  for (const suburb of sydneySuburbs) {
+    const d = levenshtein(q, suburb);
+    const ratio = d / Math.max(1, norm(suburb).length);
+    if (ratio < bestScore) {
+      bestScore = ratio;
+      best = suburb;
+    }
+  }
+
+  // ✅ accept only if "close enough"
+  // This catches Candyville -> Canley Vale type issues
+  if (best && bestScore <= 0.40) return best;
+
+  return "";
+}
+
   // Alert owner via SMS
   try {
     await client.messages.create({
@@ -341,7 +423,7 @@ app.post("/afterhours", async (req, res) => {
   } else {
     await sayOrPlay(
       twiml,
-      "Thanks — we’ve received your details and you will receive a call in the morning."
+      "Thanks — we’ve received your details and you will receive a call in the morning.   "
     );
   }
 
