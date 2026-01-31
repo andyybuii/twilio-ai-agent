@@ -279,41 +279,30 @@ app.post("/voice", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 
-  // AFTER HOURS (human-style script)
-  // ✅ Your exact vibe, ElevenLabs voice
-  await sayOrPlay(
-    twiml,
-    `Hey — it’s ${BUSINESS_NAME}. I’m on another job at the moment. What suburb are you in, and what’s going on?`
-  );
+  // AFTER HOURS → Ask suburb first (human style)
+await sayOrPlay(
+  twiml,
+  `Hey — it’s ${BUSINESS_NAME}. I’m on another job at the moment.`
+);
 
-  // Gather (speech-to-text)
-  const gather = twiml.gather({
+const gather1 = twiml.gather({
   input: "speech",
-  action: "/afterhours",
+  action: "/afterhours_suburb",
   method: "POST",
-
-  // ⬇️ IMPORTANT FIX
-  speechTimeout: 3,   // wait 3 seconds of silence
-  timeout: 12,        // max wait time
-
+  speechTimeout: "auto",
+  timeout: 12,
   language: "en-AU",
   speechModel: "phone_call",
   enhanced: true,
 });
 
-  // ✅ Use ElevenLabs for gather prompt too (so it doesn’t revert to Twilio voice)
-  sayOrPlay(
-    gather,
-    "No worries — just say your suburb, what the issue is, and whether it’s urgent. For example, water won’t stop or flooding."
-  );
+await sayOrPlay(gather1, "What suburb are you in?");
 
-  // Fallback if no speech captured
-  // Twilio will continue to this if Gather gets nothing.
-  sayOrPlay(twiml, "Sorry — I didn’t catch that. Please call again, or text this number. Goodbye.");
-  twiml.hangup();
+// Fallback if silent
+await sayOrPlay(twiml, "Sorry, I didn’t catch that. Let’s try again.");
+twiml.redirect({ method: "POST" }, "/voice");
 
-  return res.type("text/xml").send(twiml.toString());
-});
+return res.type("text/xml").send(twiml.toString());
 
 // 2) After-hours handler
 app.post("/afterhours", async (req, res) => {
