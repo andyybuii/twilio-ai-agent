@@ -126,7 +126,7 @@ function bestSydneySuburb(raw) {
 
   const best = results[0];
   // Fuse score: 0 = perfect, 1 = worst
-  if (best.score != null && best.score <= 0.30) return best.item;
+  if (best.score != null && best.score <= 0.40) return best.item;
 
   return "";
 }
